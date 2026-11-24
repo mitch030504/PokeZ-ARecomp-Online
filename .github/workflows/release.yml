@@ -128,6 +128,7 @@ jobs:
             --out "build/dist-lumiose/ZA Recomp"
           (cd build/dist-lumiose && /c/Windows/System32/tar.exe -a -cf ZA-Recomp-windows.zip "ZA Recomp" && \
             sha256sum ZA-Recomp-windows.zip > ZA-Recomp-windows.zip.sha256)
+          cp build/release-gamelib.txt build/dist-lumiose/
           ls -la build/dist-lumiose/ZA-Recomp-windows.zip
       - uses: actions/upload-artifact@v4
         with:
@@ -135,7 +136,7 @@ jobs:
           path: |
             build/dist-lumiose/ZA-Recomp-windows.zip
             build/dist-lumiose/ZA-Recomp-windows.zip.sha256
-            build/release-gamelib.txt
+            build/dist-lumiose/release-gamelib.txt
           if-no-files-found: error
 
   publish:
