@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-REPO = 'TheMagnumChad/PokeZ-ARecomp-Online'
+REPO = 'mitch030504/PokeZ-ARecomp-Online'
 ASSET = 'Lumiose-Online-linux-experimental.zip'
 PREFIX = 'Lumiose Online Linux/'
 MAX_BYTES = 4 * 1024**3

@@ -124,7 +124,7 @@ static void lang_update(void) { g_pt = settings_ui_portuguese(); }  // (runtime/
 // The start screen asks GitHub for the project's releases once per launch (a background curl, which macOS and
 // Windows 10+ ship) and offers the best one if it outranks this build: any v<x.y.z> above every beta, betas by
 // number; other tags are ignored. Offline / no curl / anything unexpected: nothing is shown.
-#define RELEASES_URL "https://api.github.com/repos/TheMagnumChad/PokeZ-ARecomp-Online/releases?per_page=100"
+#define RELEASES_URL "https://api.github.com/repos/mitch030504/PokeZ-ARecomp-Online/releases?per_page=100"
 
 static long long tag_rank(const std::string &t) {
     int n, a, b, c;

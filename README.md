@@ -8,7 +8,7 @@
 
 **English** · [Português (Brasil)](README.pt-BR.md)
 
-[Download](https://github.com/TheMagnumChad/PokeZ-ARecomp-Online/releases/latest) ·
+[Download](https://github.com/mitch030504/PokeZ-ARecomp-Online/releases/latest) ·
 
 </div>
 
@@ -100,7 +100,7 @@ On a Mac, use [MonZaMac](https://github.com/lucabravi/MonZaMac) by
 
 ## Installation
 
-1. Download the latest `ZA-Recomp-windows.zip` from [Releases](https://github.com/TheMagnumChad/PokeZ-ARecomp-Online/releases/latest)
+1. Download the latest `ZA-Recomp-windows.zip` from [Releases](https://github.com/mitch030504/PokeZ-ARecomp-Online/releases/latest)
    and extract it to a folder of your choice (for example `C:\Games\ZA Recomp`).
 2. Prepare your own copy of the game in a folder, in one of two ways:
    - **Extracted game**: the `exefs` and `romfs` folders, as an emulator or your Switch extracts them. No keys needed.
