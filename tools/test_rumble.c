@@ -30,6 +30,9 @@ static Uint32 duration;
 Uint64 SDL_GetTicks(void) { return ticks; }
 SDL_Window *SDL_GetKeyboardFocus(void) { return focus ? (SDL_Window *)1 : NULL; }
 bool menu_is_open(void) { return menu; }
+bool menu_cursor_needed(void) { return false; }  // (ZA Recomp's input.c: the mouse cursor for F1 / the start screen)
+bool bugrec_active(void) { return false; }  // (bug-report recording: F8 marks only while recording)
+void bugrec_mark(void) { abort(); }
 Settings g_settings = {.rumble = true, .rumble_strength = 100};  // (the Rumble settings: on, full, as by default)
 void SDL_LockSpinlock(SDL_SpinLock *p) { (void)p; }
 void SDL_UnlockSpinlock(SDL_SpinLock *p) { (void)p; }
@@ -47,6 +50,21 @@ void ipc_return_object(IpcResp *r, Service *s) { abort(); }
 int game_in_play(void) { abort(); }
 int cheats_link_health(int *max) { abort(); }
 int bind_label_family(void) { abort(); }
+int16_t g_bind_pad[BIND_PAD_COUNT], g_bind_key[BIND_KEY_COUNT], g_bind_mouse[MOUSEB_COUNT];
+int bind_mouse_from_sdl(int b) { (void)b; return -1; }
+int bind_pad_default(int slot) { return g_bind_pad[slot]; }
+bool menu_input_captured(void) { return false; }
+uint8_t g_main_build_id[8];
+Module g_modules[6];
+int g_nmodules;
+void guest_call(Cpu *c, uint64_t addr) { (void)c; (void)addr; abort(); }
+uint64_t renderer_present_count(void) { return 0; }
+int bind_prompt_keyboard_token(int slot, int context) { (void)slot; (void)context; return 0; }
+void discord_presence_note_input(void) {}
+int lumiose_scroll_menu_open(void) { return 0; }
+void lumiose_keyboard_note_buttons(uint64_t pressed) { (void)pressed; }
+int lumiose_chat_bridge_scroll(int16_t lines) { (void)lines; return 0; }
+bool lumiose_chat_bridge_snapshot(LumioseChatSnapshot *out) { (void)out; return false; }
 
 static IpcResp request(uint32_t cmd, const void *data, uint32_t size) {
     IpcReq r = {.cmd=cmd, .data=data, .data_size=size}; IpcResp out = {0};

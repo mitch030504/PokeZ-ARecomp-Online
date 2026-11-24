@@ -4,6 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <time.h>
+#include <sys/stat.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -47,6 +50,141 @@ static bool exists(const char *p) {
     return f != NULL;
 }
 
+// Whether the library file is whole: its header and the end of its last section are there (#332: lasgame.dll left
+// damaged on the disk - a crash or power loss while something wrote it, a disk or antivirus fault - failed to load
+// with error 193 at every start, though its .id file still matched; now the start screen builds it again, which links
+// the kept pieces in .gamebuild in a minute or two). The file's own bytes only: the OS loader still has the last word.
+static bool lib_intact(const char *path, char *why, size_t why_size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { snprintf(why, why_size, "can't be read"); return false; }
+    unsigned char h[4096];
+    size_t n = fread(h, 1, sizeof h, f);
+    fseek(f, 0, SEEK_END);
+    long long size = ftell(f);
+    fclose(f);
+    bool all_zero = true;
+    for (size_t i = 0; i < n && all_zero; i++) all_zero = !h[i];
+    if (n < 64 || all_zero) { snprintf(why, why_size, "%s (%lld bytes)", all_zero ? "all zero" : "too short", size); return false; }
+#ifdef _WIN32
+    if (h[0] != 'M' || h[1] != 'Z') { snprintf(why, why_size, "no MZ header"); return false; }
+    uint32_t pe = *(uint32_t *)(h + 0x3C);
+    if (pe > n - 24 || memcmp(h + pe, "PE\0\0", 4)) { snprintf(why, why_size, "no PE header"); return false; }
+    uint16_t nsec = *(uint16_t *)(h + pe + 6), opt = *(uint16_t *)(h + pe + 20);
+    size_t sec = pe + 24 + opt;
+    if (sec + 40ull * nsec > n) { snprintf(why, why_size, "section table cut"); return false; }
+    long long end = 0;
+    for (int i = 0; i < nsec; i++) {
+        const unsigned char *s = h + sec + 40 * i;
+        long long e = (long long)*(uint32_t *)(s + 20) + *(uint32_t *)(s + 16);  // PointerToRawData + SizeOfRawData
+        if (e > end) end = e;
+    }
+    if (size < end) { snprintf(why, why_size, "cut short: %lld of %lld bytes", size, end); return false; }
+#elif defined(__APPLE__)
+    uint32_t m = *(uint32_t *)h;
+    if (m != 0xFEEDFACFu && m != 0xCAFEBABEu && m != 0xBEBAFECAu) { snprintf(why, why_size, "no Mach-O header"); return false; }
+#else
+    if (memcmp(h, "\x7f" "ELF", 4)) { snprintf(why, why_size, "no ELF header"); return false; }
+    uint64_t shoff = *(uint64_t *)(h + 0x28);
+    uint16_t shentsize = *(uint16_t *)(h + 0x3A), shnum = *(uint16_t *)(h + 0x3C);
+    long long end = (long long)shoff + (long long)shentsize * shnum;
+    if (size < end) { snprintf(why, why_size, "cut short: %lld of %lld bytes", size, end); return false; }
+#endif
+    return true;
+}
+
+// The library's fingerprint, <library>.sum: its size and a hash of each of 64 regions of the whole file, written after
+// its first good load and dropped by each build (build_cache.cpp). #332 came back on v0.1.26 with a library the header /
+// section checks passed - damaged inside - so a start now also hashes the file (8 bytes a step: ~0.1 s for 340 MB once
+// it's in the file cache, and the load reads it anyway): one that changed since is damaged, and the log says how (size,
+// how many regions and where, when the file was last written: what happened to it then).
+#define SUM_N 64
+static bool lib_sample(const char *path, long long *size, uint32_t h[SUM_N], long long *mtime) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    struct stat sb;
+    *mtime = stat(path, &sb) == 0 ? (long long)sb.st_mtime : 0;
+    *size = stat(path, &sb) == 0 ? (long long)sb.st_size : 0;
+    enum { CH = 1 << 16 };
+    long long region = ((*size + SUM_N - 1) / SUM_N + CH - 1) / CH * CH;  // (a whole number of reads per region)
+    if (region < CH) region = CH;
+    static uint64_t buf[CH / 8];
+    uint64_t x[SUM_N];
+    for (int i = 0; i < SUM_N; i++) x[i] = 14695981039346656037ull;
+    long long at = 0;
+    for (size_t n; (n = fread(buf, 1, CH, f)) > 0; at += (long long)n) {
+        int r = (int)(at / region);
+        if (r >= SUM_N) r = SUM_N - 1;
+        uint64_t v = x[r];
+        size_t w = n / 8;
+        for (size_t k = 0; k < w; k++) v = (v ^ buf[k]) * 1099511628211ull;
+        for (size_t k = w * 8; k < n; k++) v = (v ^ ((unsigned char *)buf)[k]) * 1099511628211ull;
+        x[r] = v;
+    }
+    fclose(f);
+    for (int i = 0; i < SUM_N; i++) h[i] = (uint32_t)(x[i] ^ x[i] >> 32);
+    return *size > 0;
+}
+static void lib_sum_write(const char *path) {
+    char sp[1120];
+    snprintf(sp, sizeof sp, "%s.sum", path);
+    if (exists(sp)) return;  // (kept: the first good load's)
+    long long size, mt;
+    uint32_t h[SUM_N];
+    if (!lib_sample(path, &size, h, &mt)) return;
+    FILE *f = fopen(sp, "wb");
+    if (!f) return;
+    fprintf(f, "LASSUM1 %lld %lld", size, mt);
+    for (int i = 0; i < SUM_N; i++) fprintf(f, " %08x", h[i]);
+    fputc('\n', f);
+    fclose(f);
+}
+// false (and why): the library differs from its fingerprint; true when it matches or has none yet
+static bool lib_sum_ok(const char *path, char *why, size_t why_size) {
+    char sp[1120];
+    snprintf(sp, sizeof sp, "%s.sum", path);
+    FILE *f = fopen(sp, "rb");
+    if (!f) return true;
+    long long size0 = -1, mt0 = 0;
+    uint32_t h0[SUM_N];
+    int n = fscanf(f, "LASSUM1 %lld %lld", &size0, &mt0) == 2 ? 0 : -1;
+    for (int i = 0; n == 0 && i < SUM_N; i++) if (fscanf(f, " %x", &h0[i]) != 1) n = -1;
+    fclose(f);
+    if (n < 0) return true;  // (unreadable: no verdict)
+    long long size, mt;
+    uint32_t h[SUM_N];
+    if (!lib_sample(path, &size, h, &mt)) return true;
+    int diff = 0, first = -1;
+    for (int i = 0; i < SUM_N; i++) if (h[i] != h0[i]) diff++, first = first < 0 ? i : first;
+    if (size == size0 && !diff) return true;
+    time_t t = (time_t)mt;
+    struct tm *tm = localtime(&t);
+    char when[32] = "?";
+    if (tm) strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", tm);
+    snprintf(why, why_size, "changed since its first good start: size %lld -> %lld, %d of %d regions differ (the first %d%% in), "
+             "file last written %s%s", size0, size, diff, SUM_N, first < 0 ? 0 : first * 100 / (SUM_N - 1), when,
+             mt != mt0 ? "" : ", the same time as then");
+    return false;
+}
+
+// A library whose .id matches but whose file is damaged: told once, then taken for not built (and moved aside so the
+// build writes a fresh one; the build's pieces in .gamebuild are kept)
+static bool lib_usable(const char *path) {
+    char why[256];
+    if (lib_intact(path, why, sizeof why) && lib_sum_ok(path, why, sizeof why)) return true;
+    static char told[1100];
+    if (strcmp(told, path)) {
+        snprintf(told, sizeof told, "%s", path);
+        LOG("[gamelib] %s is damaged (%s): it will be built again\n", path, why);
+        char bad[1120];
+        snprintf(bad, sizeof bad, "%s.damaged", path);
+        remove(bad);
+        rename(path, bad);
+        snprintf(bad, sizeof bad, "%s.sum", path);  // (the next build's library gets its own)
+        remove(bad);
+    }
+    return false;
+}
+
 // The places to look, in order (gamelib.h). Returns how many were filled.
 static int candidates(const char *game_dir, char out[3][1100]) {
     int n = 0;
@@ -59,19 +197,37 @@ static int candidates(const char *game_dir, char out[3][1100]) {
     return n;
 }
 
+// This build's game-code id (the Makefile's GAMELIB_ID): the start screen compares it with a newer release's (its notes'
+// "<!-- zarecomp-gamelib: <id> -->", runtime/ui/launcher.mm update_thread) to say whether updating rebuilds the game
+// code (tools/za/dist.sh writes the notes' line from make gamelib-id).
+const char *gamelib_build_id(void) { return GAMELIB_ID; }
+
+// (a library already loaded - back on the start screen after playing - counts only while it is still the one wanted:
+// the on mods' .pchtxt patches are in the id, and a set turned on or off since needs another; gamelib_stale)
 bool gamelib_present(const char *game_dir) {
-    if (g_tables) return true;
     char want[GAMELIB_FULL_ID_SIZE];
-    if (!game_dir || !gamelib_full_id(game_dir, want, sizeof want)) return false;
+    if (!game_dir || !gamelib_full_id(game_dir, want, sizeof want)) return g_tables != NULL;
+    if (g_tables) return !strcmp(g_tables->id, want);
     char c[3][1100];
     int n = candidates(game_dir, c);
     for (int i = 0; i < n; i++)
-        if (exists(c[i]) && id_matches(c[i], want)) return true;
+        if (exists(c[i]) && id_matches(c[i], want) && lib_usable(c[i])) return true;
     return false;
+}
+
+bool gamelib_stale(const char *game_dir) {
+    char want[GAMELIB_FULL_ID_SIZE];
+    return g_tables && game_dir && gamelib_full_id(game_dir, want, sizeof want) && strcmp(g_tables->id, want);
 }
 
 static const GameLibTables *open_lib(const char *path, const char *want) {
 #ifdef _WIN32
+    // (a full path: LoadLibrary takes a relative one with a folder in it from the program's folder first - a data
+    // folder elsewhere (LARECOMP_DATA_ROOT) next to a program folder with its own extracted/ loaded
+    // that copy's library: "built for another version")
+    char full[MAX_PATH];
+    DWORD fn = GetFullPathNameA(path, sizeof full, full, NULL);
+    if (fn && fn < sizeof full) path = full;
     HMODULE h = LoadLibraryA(path);
     if (!h) { snprintf(g_error, sizeof g_error, "can't load %s (error %lu)", path, GetLastError()); return NULL; }
     GameLibEntry entry = (GameLibEntry)(void *)GetProcAddress(h, GAMELIB_ENTRY);
@@ -110,7 +266,13 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
                 snprintf(g_error, sizeof g_error, "%s was built for another version", c[i]);
                 continue;
             }
+            if (!given && !lib_usable(c[i])) {
+                snprintf(g_error, sizeof g_error, "%s was damaged on the disk: open ZA Recomp again and the start "
+                         "screen builds it again", c[i]);
+                continue;
+            }
             g_tables = open_lib(c[i], want);
+            if (g_tables) lib_sum_write(c[i]);
             if (g_tables) LOG("[gamelib] %s (%llu + %llu functions)\n", c[i], (unsigned long long)*g_tables->main_count,
                               (unsigned long long)*g_tables->sdk_count);
         }

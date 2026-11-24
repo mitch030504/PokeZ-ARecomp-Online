@@ -50,3 +50,6 @@ __pycache__/
 /lumiose/config.json
 # Claude Code: machine-specific notes
 CLAUDE.local.md
+
+# players' bug recordings (runtime/bugrec.c): their saves
+bug-reports/

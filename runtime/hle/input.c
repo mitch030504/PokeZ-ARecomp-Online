@@ -2,11 +2,12 @@
 //
 // Both go through the player's bindings (runtime/hle/bindings.c, defaults there: keyboard WASD left stick, arrows
 // d-pad, Space/J/L/I = A/B/X/Y, Q/E = L/R, 1/3 = ZL/ZR, Enter / Backspace = Plus / Minus, numpad 8/4/5/6 right stick;
-// controller: Switch A = east for a Nintendo pad, but A = the pad's own A (south) for Xbox / PlayStation pads, whose
-// prompts the menus and the game show by label).
+// controller by position, Switch A = east; a first start with an Xbox / PlayStation pad applies the Xbox-letters preset
+// once in runtime/hle/bindings.c bind_pad_first_start).
 #include <SDL3/SDL.h>
 #include <ctype.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -266,26 +267,9 @@ static void recompute_keyboard(void) {
 // Controller buttons (and the triggers as buttons) -> Switch buttons through g_bind_pad; the sticks stay the sticks.
 static _Atomic int pad_family;
 static bool pad_by_pos;  // (battle_abxy_position: ZL held at the last recompute_pad)
-static bool pad_face_by_label;  // (Xbox / PlayStation pad, default bindings: A/B/X/Y by the pad's labels)
-static int pad_host(int i, bool by_pos) {
-    if (i <= BIND_Y) {
-        if (by_pos) return bind_pad_default(i);  // (Nintendo positions: A east, B south, X north, Y west)
-        if (pad_face_by_label) {  // (SDL positions: A south, B east, X west, Y north)
-            static const int label[BIND_Y + 1] = {SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST,
-                                                   SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH};
-            return label[i];
-        }
-    }
-    return g_bind_pad[i];
-}
+static int pad_host(int i, bool by_pos) { return by_pos && i <= BIND_Y ? bind_pad_default(i) : g_bind_pad[i]; }
 static void recompute_pad(void) {
     uint32_t host = test_pad;
-    pad_face_by_label = input_pad_family() != 0 && bind_is_default(BIND_DEV_PAD);
-    static bool label_logged;
-    if (pad_face_by_label && !label_logged) {
-        label_logged = true;
-        LOG("[input] ABXY by the pad's labels (A = south, B = east, X = west, Y = north)\n");
-    }
     if (pad && !host_test) {
         for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; i++)
             if (SDL_GetGamepadButton(pad, (SDL_GamepadButton)i)) host |= 1u << i;
@@ -295,8 +279,13 @@ static void recompute_pad(void) {
     // battle_abxy_position: Pokémon Z-A's moves are used only with ZL held and sit where the Switch's A/B/X/Y are,
     // so with A/B/X/Y bound by letter (Xbox A = the Switch's A) they read swapped. While ZL is held those four go by
     // position, as in the defaults; the rest of the game keeps the player's bindings (#26).
-    int zl = g_bind_pad[BIND_ZL];
-    bool by_pos = pad_by_pos = g_settings.battle_abxy_position && zl >= 0 && zl < PADB_HOST_COUNT && (host >> zl & 1);
+    // Not with ZR held too: ZL aims at a Pokémon and ZR holds the ball ready to throw, outside battles - cancelling
+    // that throw (the Switch's B) then sat on the wrong button, B doing nothing and A cancelling (#224: B cancelled
+    // with RT alone and not with LT + RT). Moves are never used with ZR held.
+    int zl = g_bind_pad[BIND_ZL], zr = g_bind_pad[BIND_ZR];
+    bool zr_held = zr >= 0 && zr < PADB_HOST_COUNT && (host >> zr & 1);
+    bool by_pos = pad_by_pos = g_settings.battle_abxy_position && zl >= 0 && zl < PADB_HOST_COUNT && (host >> zl & 1) &&
+                               !zr_held;
     uint64_t b = 0;
     for (int i = 0; i < BIND_PAD_COUNT; i++) {
         int h = pad_host(i, by_pos);
@@ -310,6 +299,38 @@ static void recompute_pad(void) {
         pad_ly = -SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY);
         rx = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX);
         ry = -SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY);
+    }
+    // Left stick dead zone + steadiness (pad only): the stick went to the game raw, and the game picks walk or run from
+    // its length, so a pad whose stick wobbles by a few hundred around that threshold flipped walk <-> run every frame.
+    // A radial dead zone (lstick_deadzone, percent, default 10, 0 = off) is cut off and the rest rescaled to the full
+    // range; a pad's stick often stops short of full travel on the diagonals (85-90%) and never reached the game's run
+    // threshold, so from lstick_outer (default 90) up it reads as full. Then a length that moved less than ~2% from the
+    // last one keeps the last (the direction always follows), so noise can't carry it back and forth over the
+    // threshold. Keyboard and d-pad values are not touched.
+    if (pad && !host_test) {
+        static double last_m;
+        int dz_pct = g_settings.lstick_deadzone, out_pct = g_settings.lstick_outer;
+        if (out_pct < dz_pct + 10) out_pct = dz_pct + 10;
+        if (dz_pct > 0) {
+            double x = pad_lx, y = pad_ly, m = sqrt(x * x + y * y), dz = 32767.0 * dz_pct / 100, outer = 32767.0 * out_pct / 100;
+            if (m <= dz) m = 0;
+            else {
+                double n = (m - dz) / (outer - dz) * 32767.0;  // (the length, rescaled)
+                if (n > 32767) n = 32767;
+                if (fabs(n - last_m) < 650 && n < 32000) n = last_m;  // (near full tilt it still reaches the end)
+                x *= n / m, y *= n / m;
+                m = n;
+            }
+            last_m = m;
+            pad_lx = (int32_t)lround(m ? x : 0), pad_ly = (int32_t)lround(m ? y : 0);
+        }
+    }
+    // rstick_deadzone (#275): a right stick that doesn't center (drift) turned the camera on its own. A radial dead zone
+    // like the left stick's, the rest rescaled to the full range; 0 (the default) leaves the stick raw.
+    if (pad && !host_test && g_settings.rstick_deadzone > 0 && (rx || ry)) {
+        double m = sqrt((double)rx * rx + (double)ry * ry), dz = 32767.0 * g_settings.rstick_deadzone / 100;
+        double n = m <= dz ? 0 : fmin((m - dz) / (32767.0 - dz) * 32767.0, 32767.0);
+        rx = (int32_t)lround(rx * n / m), ry = (int32_t)lround(ry * n / m);
     }
     // rstick_snap: a stick pushed sideways also reads a little up or down (an Xbox One pad: 4 degrees on average, up
     // to 12), and the camera tilts with it. That close to an axis the stick is put on the axis; the angles in between
@@ -2516,6 +2537,32 @@ bool input_title_key_event(const SDL_Event *e){
         atomic_store(&title_confirm_until,renderer_present_count()+4);
     return true;
 }
+// The game reads one controller: the one the player is using (#455: a two-port adapter is two gamepads, and the
+// working controller may be in port 2). Every connected gamepad is open, so its events arrive; a button press on
+// another one makes it the game's, and so does a stick or trigger pushed well past drift while the game's own is at
+// rest (a noisy idle stick can't take it from a player who's playing). The light and rumble go with it.
+static bool pad_at_rest(void) {
+    int32_t lx = pad_lx, ly = pad_ly, rx = pad_rx, ry = pad_ry;
+    return !pad_buttons && abs(lx) < 8000 && abs(ly) < 8000 && abs(rx) < 8000 && abs(ry) < 8000;
+}
+static void use_pad(SDL_JoystickID id, const char *why) {
+    SDL_Gamepad *g = SDL_GetGamepadFromID(id);
+    if (!g || g == pad) return;
+    if (pad) {
+        led_restore("controller changed");
+        SDL_RumbleGamepad(pad, 0, 0, 0);
+        rumble_last_lo = rumble_last_hi = 0, rumble_warned = false;  // (the next poll starts it on the new one)
+    }
+    pad = g;
+    mouse_disable_gameplay_for_pad();
+    LOG("[input] gamepad: %s%s\n", SDL_GetGamepadName(pad), why);
+    note_family();
+    recompute_pad();
+}
+static void open_pad(SDL_JoystickID id) {
+    if (!SDL_GetGamepadFromID(id)) SDL_OpenGamepad(id);
+    if (!pad) use_pad(id, "");
+}
 void input_handle_event(const SDL_Event *e) {
     // A click can open a different presenter before its release arrives.
     // Release the physical touch before any presenter or controller gate can
@@ -2540,7 +2587,7 @@ void input_handle_event(const SDL_Event *e) {
         scanned = true;
         int n = 0;
         SDL_JoystickID *ids = SDL_GetGamepads(&n);
-        if (n > 0 && !pad) { pad = SDL_OpenGamepad(ids[0]); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+        for (int i = 0; ids && i < n; i++) open_pad(ids[i]);
         SDL_free(ids);
     }
     // Mouse clicks still feed the mod's touchscreen UI with a controller
@@ -2612,6 +2659,11 @@ void input_handle_event(const SDL_Event *e) {
             }
             mouse_cancel_aim();
         }
+        if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F8 && !e->key.repeat) {
+            extern bool bugrec_active(void);
+            extern void bugrec_mark(void);
+            if (bugrec_active()) bugrec_mark();  // (recording for a bug report: runtime/bugrec.c)
+        }
         if (e->key.scancode < SDL_SCANCODE_COUNT) keys_down[e->key.scancode] = e->type == SDL_EVENT_KEY_DOWN;
         // Apply the cursor transition before processing a click in the same event batch.
         if (e->key.scancode == SDL_SCANCODE_LALT && touch_window) input_mouse_update(touch_window);
@@ -2622,31 +2674,32 @@ void input_handle_event(const SDL_Event *e) {
         break;
     }
     case SDL_EVENT_GAMEPAD_ADDED:
-        if (!pad) {
-            pad = SDL_OpenGamepad(e->gdevice.which);
-            if (pad) { mouse_disable_gameplay_for_pad(); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
-        }
+        open_pad(e->gdevice.which);
         break;
-    case SDL_EVENT_GAMEPAD_REMOVED:
-        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) {
+    case SDL_EVENT_GAMEPAD_REMOVED: {
+        SDL_Gamepad *g = SDL_GetGamepadFromID(e->gdevice.which);
+        if (g && g == pad) {
             SDL_RumbleGamepad(pad, 0, 0, 0);
-            SDL_CloseGamepad(pad); pad = NULL;
-            // Other controllers may have been connected while this one was
-            // active. Keep mouse input disabled until the last one is gone.
-            int count = 0;
-            SDL_JoystickID *ids = SDL_GetGamepads(&count);
-            for (int i = 0; ids && i < count && !pad; i++)
-                if (ids[i] != e->gdevice.which) pad = SDL_OpenGamepad(ids[i]);
-            SDL_free(ids);
-            if (pad) LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad));
-            note_family();
+            pad = NULL;
             touch_active = 0; touch_pending = 0;
             led_forget();  // (gone: it shows its own colour when it comes back)
             rumble_clear(); rumble_last_lo = rumble_last_hi = 0; rumble_warned = false;
         }
+        if (g) SDL_CloseGamepad(g);
+        if (!pad) {  // another one still connected takes over
+            int n = 0;
+            SDL_JoystickID *ids = SDL_GetGamepads(&n);
+            for (int i = 0; ids && i < n && !pad; i++)
+                if (ids[i] != e->gdevice.which) open_pad(ids[i]);
+            SDL_free(ids);
+            note_family();
+        }
         recompute_pad();
         break;
+    }
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        if (e->gbutton.down && e->gbutton.which != TEST_DEVICE && !host_test) use_pad(e->gbutton.which, " (switched)");
+        if (pad && e->gbutton.which != TEST_DEVICE && e->gbutton.which != SDL_GetGamepadID(pad)) break;  // (another pad)
         if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
             atomic_fetch_add(&bag_drag_generation, 1); atomic_store(&bag_drag_request, 0);
         }
@@ -2657,6 +2710,8 @@ void input_handle_event(const SDL_Event *e) {
         recompute_pad();
         break;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+        if (!host_test && abs(e->gaxis.value) > 24000 && pad_at_rest()) use_pad(e->gaxis.which, " (switched)");
+        if (pad && e->gaxis.which != SDL_GetGamepadID(pad)) break;  // (another pad's stick: not the game's)
         if ((e->gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || e->gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) &&
             !host_test) {  // (the triggers as buttons: past half way)
             static bool trig[2];
@@ -3488,9 +3543,16 @@ uint64_t g_replay_key;
 bool g_replay_handed;      // (the replay reached LARECOMP_REPLAY_UNTIL: live input again)
 typedef struct { uint64_t read; Settings s; } RecSettings;
 static int hexval(int ch) { return ch <= '9' ? ch - '0' : (ch | 32) - 'a' + 10; }
+static FILE *rec;  // (recording: LARECOMP_RECORD's file; under rec_lock - input_record_stop closes it from another thread)
+static pthread_mutex_t rec_lock = PTHREAD_MUTEX_INITIALIZER;
+// The recording ends here (runtime/bugrec.c: before it packs the file) - closed, nothing written after
+void input_record_stop(void) {
+    pthread_mutex_lock(&rec_lock);
+    if (rec) fclose(rec), rec = NULL;
+    pthread_mutex_unlock(&rec_lock);
+}
 static void record_state(uint64_t read, uint64_t *b, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     static int mode = -1;  // 0 off, 1 record, 2 replay
-    static FILE *rec;
     static RecState *tab, last = {.read = ~0ull};
     static size_t n, at;
     static RecSettings *stab, slast;
@@ -3552,6 +3614,8 @@ static void record_state(uint64_t read, uint64_t *b, int32_t *lx, int32_t *ly, i
         }
     }
     if (mode == 1) {
+        pthread_mutex_lock(&rec_lock);
+        if (!rec) { mode = 0; pthread_mutex_unlock(&rec_lock); return; }  // (input_record_stop)
         static bool first_s = true;
         if (first_s || memcmp(&g_settings, &slast.s, sizeof g_settings)) {
             first_s = false;
@@ -3566,6 +3630,7 @@ static void record_state(uint64_t read, uint64_t *b, int32_t *lx, int32_t *ly, i
             fprintf(rec, "%llu %llx %d %d %d %d\n", (unsigned long long)key, (unsigned long long)*b, *lx, *ly, *rx, *ry);
             fflush(rec);  // (the game may be closed any way: every change is on disk)
         }
+        pthread_mutex_unlock(&rec_lock);
     } else if (mode == 2) {
         for (; sat < sn && stab[sat].read <= key; sat++) {
             if (getenv("LARECOMP_REPLAY_ONLY_FPS")) g_settings.fps60 = stab[sat].s.fps60;  // (the rest: this run's own)
@@ -3803,11 +3868,49 @@ static void fill_state(Cpu *c) {
     *(uint32_t *)(s + 32) = 1;  // IsConnected
 }
 
-HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj", hid_state_fullkey) { fill_state(c); }
-HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj", hid_state_dual) { fill_state(c); }
-HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj", hid_state_left) { fill_state(c); }
-HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj", hid_state_handheld) { fill_state(c); }
-HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj", hid_state_right) { fill_state(c); }
+// With code mods: GetNpadState(state, id) goes through detail::GetNpadStates(&count, state, 1, id), as the console's
+// SDK does, and by its slot - which a mod's hook takes over (codehooks_rt.c hle_swap; its original: hid_states below).
+// The Cheat/Debug Menu reads the pad there (hold ZL, tap R: its menu) and hides it from the game while its menu is
+// open; with only the host's GetNpadState it saw no input at all (#308). Without code mods: the state, as before.
+static void npad_state(Cpu *c, const char *detail, HostFn states) {
+    if (g_nmodules <= 2) { fill_state(c); return; }
+    uint64_t state = c->x[0], id = c->x[1];
+    c->sp -= 16;  // (the count, on the guest stack)
+    c->x[0] = c->sp, c->x[1] = state, c->x[2] = 1, c->x[3] = id;
+    guest_call(c, hle_register(detail, states));  // (its slot: made by hle_swap when a mod hooked it, else here)
+    c->sp += 16;
+}
+static void hid_states(Cpu *c) {  // Result detail::GetNpadStates(int *count, State *out, int n, const NpadIdType &id)
+    uint64_t count = c->x[0];
+    int n = (int)c->x[2];
+    if (n > 0) {
+        c->x[0] = c->x[1], c->x[1] = c->x[3];
+        fill_state(c);
+    }
+    *(int32_t *)(uintptr_t)count = n > 0;
+    c->x[0] = 0;  // its Result: the SDK's own GetNpadState aborts on any other (the mod calls that one too)
+}
+#define DETAIL(ty) "_ZN2nn3hid6detail13GetNpadStatesEPiPNS0_" ty "EiRKj"
+HLE_FUNC(DETAIL("16NpadFullKeyState"), hid_states_fullkey) { hid_states(c); }
+HLE_FUNC(DETAIL("16NpadJoyDualState"), hid_states_dual) { hid_states(c); }
+HLE_FUNC(DETAIL("16NpadJoyLeftState"), hid_states_left) { hid_states(c); }
+HLE_FUNC(DETAIL("17NpadHandheldState"), hid_states_handheld) { hid_states(c); }
+HLE_FUNC(DETAIL("17NpadJoyRightState"), hid_states_right) { hid_states(c); }
+HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj", hid_state_fullkey) {
+    npad_state(c, DETAIL("16NpadFullKeyState"), hid_states_fullkey);
+}
+HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj", hid_state_dual) {
+    npad_state(c, DETAIL("16NpadJoyDualState"), hid_states_dual);
+}
+HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj", hid_state_left) {
+    npad_state(c, DETAIL("16NpadJoyLeftState"), hid_states_left);
+}
+HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj", hid_state_handheld) {
+    npad_state(c, DETAIL("17NpadHandheldState"), hid_states_handheld);
+}
+HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj", hid_state_right) {
+    npad_state(c, DETAIL("17NpadJoyRightState"), hid_states_right);
+}
 
 // FullKey for player 1 only (we report docked mode, where Handheld is unavailable)
 HLE_FUNC("_ZN2nn3hid15GetNpadStyleSetERKj", hid_style_set) {

@@ -167,19 +167,33 @@ extern const uint8_t g_user_id[16];
 // event is signalled, it has no output, and its input (the error's arguments) is logged.
 static const char *applet_name(uint32_t id) {
     switch (id) {
+    case 0x0a: return "auth";
+    case 0x0b: return "amiibo";
+    case 0x0c: return "controller";
+    case 0x0d: return "data erase";
     case 0x0e: return "error";
-    case 0x0a: return "player select";
-    case 0x0f: return "web";
-    case 0x10: return "shop";
+    case 0x0f: return "net connect";
+    case 0x10: return "player select";
     case 0x11: return "keyboard";
-    case 0x12: return "photo viewer";
-    case 0x13: return "web (offline)";
-    case 0x15: return "login share";
-    case 0x16: return "wifi web auth";
+    case 0x12: return "Mii edit";
+    case 0x13: return "web";
+    case 0x14: return "shop";
+    case 0x15: return "photo viewer";
+    case 0x16: return "settings";
+    case 0x17: return "web (offline)";
+    case 0x18: return "login share";
+    case 0x19: return "wifi web auth";
+    case 0x1a: return "my page";
     default: return "?";
     }
 }
-typedef struct { uint32_t id; KEvent *state_ev; uint32_t state_r; bool started; } AmApplet;
+// The browser applets (web, shop, offline web) hand back how they were left, as the console's do: Pokemon Z-A's
+// "Downloadable Content Available" on the title screen (Minus, without the DLC) opens the shop on its add-on content
+// page (?scene=aocs&mode=mini), then pops that answer - with none, it aborted at once (#194: "the game stopped at one
+// of its own checks"). Their answer here: WebCommonReturnValue (exit reason u32, pad, last URL [0x1000], its length
+// u64) with exit reason 0, the close button - the player left the shop without buying.
+static bool applet_is_web(uint32_t id) { return id == 0x13 || id == 0x14 || id == 0x17; }
+typedef struct { uint32_t id; KEvent *state_ev; uint32_t state_r; bool started, out_popped; } AmApplet;
 static void applet_accessor(Service *s, IpcReq *req, IpcResp *resp) {
     AmApplet *a = s->state;
     switch (req->cmd) {
@@ -208,13 +222,33 @@ static void applet_accessor(Service *s, IpcReq *req, IpcResp *resp) {
         }
         break;
     }
-    case 101: case 104:  // PopOutData / PopInteractiveOutData: nothing
+    case 101:  // PopOutData: the browser applets' answer (once, after Start), else nothing
+        if (applet_is_web(a->id) && a->started && !a->out_popped) {
+            static uint8_t ret[0x1010];  // (WebCommonReturnValue: all zero = exit reason 0, the close button; no URL)
+            a->out_popped = true;
+            LOG("[am] %s applet: answers \"closed by the player\" (%u bytes)\n", applet_name(a->id), (unsigned)sizeof ret);
+            ipc_return_object(resp, new_am_storage(ret, sizeof ret));
+        } else {
+            resp->result = AM_NO_DATA;
+        }
+        break;
+    case 104:  // PopInteractiveOutData: nothing
         resp->result = AM_NO_DATA;
         break;
-    case 105: case 106: {  // GetPopOutDataEvent / GetPopInteractiveOutDataEvent: never
-        resp->copy_handles[resp->ncopy++] = new_event();
+    case 105: {  // GetPopOutDataEvent: signalled when there is an answer (the browser applets', at Start)
+        uint32_t w, r;
+        KEvent *ev = kernel_create_event_pair(&w, &r);
+        if (applet_is_web(a->id)) {
+            pthread_mutex_lock(&g_klock);
+            kernel_signal(ev);
+            pthread_mutex_unlock(&g_klock);
+        }
+        resp->copy_handles[resp->ncopy++] = r;
         break;
     }
+    case 106:  // GetPopInteractiveOutDataEvent: never
+        resp->copy_handles[resp->ncopy++] = new_event();
+        break;
     default: LOG("[am] ILibraryAppletAccessor (%s) cmd %u (ok)\n", applet_name(a->id), req->cmd);
     }
 }
@@ -260,7 +294,21 @@ static void application_functions(Service *s, IpcReq *req, IpcResp *resp) {
         resp_size(resp, 8);
         break;
     }
-    case 23: memcpy(resp->data, "1.0.0", 6); resp_size(resp, 0x10); break;
+    case 23: {  // GetDisplayVersion: the game's own version, as on the console. It was "1.0.0" for any game (Link's
+                // Awakening's): code mods that pick their hooks by it read Pokémon Z-A 2.0.0 / 2.0.2 as 1.0.0 (#258)
+        static const struct { uint8_t id[8]; const char *v; } za[] = {
+            {{0x72, 0x22, 0xe1, 0x3e, 0xcf, 0x6a, 0xdb, 0x32}, "1.0.0"},
+            {{0x8a, 0x1c, 0x86, 0xc4, 0x37, 0x39, 0x4b, 0x69}, "2.0.0"},
+            {{0xb1, 0xf1, 0x2f, 0xd9, 0x19, 0xea, 0xe8, 0x6a}, "2.0.2"}};
+        extern uint8_t g_main_build_id[8];
+        const char *v = "1.0.0";
+        for (size_t i = 0; i < sizeof za / sizeof za[0]; i++)
+            if (!memcmp(g_main_build_id, za[i].id, 8)) v = za[i].v;
+        memset(resp->data, 0, 0x10);
+        memcpy(resp->data, v, strlen(v) + 1);
+        resp_size(resp, 0x10);
+        break;
+    }
     case 40: OUT(uint8_t, 0) = 0; resp_size(resp, 1); break;  // NotifyRunning
     case 120:  // ExecuteProgram: the guest expects its current process to be replaced.
         LOG("[am] application requested a program restart; returning to the start screen\n");

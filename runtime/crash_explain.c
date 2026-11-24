@@ -12,6 +12,7 @@
 #include "rt.h"
 #include "settings.h"
 
+const char *codemods_at(uint64_t pc);  // runtime/codemods.c
 static char g_line[512];   // the first fatal line (FATAL message / "signal 11 accessing 0x10")
 static uint64_t g_pc;      // a crash's host pc (0: a FATAL)
 bool rt_game_data_bad;
@@ -87,7 +88,23 @@ static bool dozen_crash_to_vulkan(void) {
 }
 
 // (device.c vk_compile_crash_recover; LARECOMP_TEST_COMPILE_CRASH: the test's crash is in build_pipeline itself)
-bool rt_compile_crash_at(uint64_t pc) { return in_gpu_driver(pc) || getenv("LARECOMP_TEST_COMPILE_CRASH"); }
+bool rt_compile_crash_at(uint64_t pc) {
+    return in_gpu_driver(pc) || getenv("LARECOMP_TEST_COMPILE_CRASH") || getenv("LARECOMP_TEST_COMPILE_CRASH_URGENT");
+}
+
+// The start screen's check of the game files (runtime/ui/launcher.mm launcher_verify_kick, tools/za/verify_files.py):
+// cache/verify.txt "damaged <version> <packs>" - a damaged download of the 2.0.2 update went around (Scraggy's model
+// pack), and the game crashed wherever it first loaded it (#173 #223 #233 #294 #301)
+static bool game_files_damaged(char *version, size_t n) {
+    char line[128] = "", v[32] = "";
+    FILE *f = fopen("cache/verify.txt", "rb");
+    if (!f) return false;
+    if (!fgets(line, sizeof line, f)) line[0] = 0;
+    fclose(f);
+    if (sscanf(line, "damaged %31s", v) != 1) return false;
+    snprintf(version, n, "%s", v);
+    return true;
+}
 
 void rt_crash_explain(char *out, size_t n, const char *log_path) {
     static const char *const report = "Please report this bug in the LumioseOnline Discord and attach the log file below. "
@@ -95,7 +112,7 @@ void rt_crash_explain(char *out, size_t n, const char *log_path) {
     // (g_game_is_la is Link's Awakening's until the game's files are read: a crash on the start screen or while the
     // GPU starts said "LAS Recomp stopped", #159)
     const char *app = g_game_is_la && rt_romfs_files >= 0 ? "LAS Recomp" : "ZA Recomp";
-    char head[160], what[600];
+    char head[160], what[600], dmg[32];
     extern void vk_compile_crash_note(void) __attribute__((weak));  // (Vulkan: was this thread compiling a pipeline?)
     if (vk_compile_crash_note && g_pc && rt_compile_crash_at(g_pc)) vk_compile_crash_note();
     // (the file count is Link's Awakening's: Pokémon Z-A's RomFS has its own, and every crash read as missing files)
@@ -104,6 +121,11 @@ void rt_crash_explain(char *out, size_t n, const char *log_path) {
         snprintf(what, sizeof what, "%s found %d of the game's %d files, and the game stopped when it needed "
                  "one that's missing. Copy your game files again so none are missing, then set them up again on the "
                  "start screen (Game Files).", app, rt_romfs_files, (int)ROMFS_FILES);
+    } else if (has("the game files are incomplete")) {  // (runtime/services/fs.c: no arc/data.trpfs in the folder, #311)
+        snprintf(head, sizeof head, "Your game files are incomplete");
+        snprintf(what, sizeof what, "arc/data.trpfs, the file with the game's models, maps and texts (about 4.7 GB), "
+                 "is missing from the game files' folder (extracted/romfs). On the start screen: Settings > Delete game "
+                 "files, then choose your .xci / .nsp files again - the setup extracts everything itself.");
     } else if (has("doesn't fit its language")) {
         snprintf(head, sizeof head, "Your game files' text has been changed");
         snprintf(what, sizeof what, "The game's text for this language comes from another language (a translation "
@@ -138,6 +160,12 @@ void rt_crash_explain(char *out, size_t n, const char *log_path) {
                  : "%s will now build shaders without the driver's optimizer and skip the few effects that first appeared "
                    "just before it (one may be missing). Start the game again: it may run slower until you update your "
                    "graphics driver.", app);
+    } else if (!g_game_is_la && game_files_damaged(dmg, sizeof dmg)) {  // (any crash in the game: the likeliest cause)
+        snprintf(head, sizeof head, "Your game files are damaged");
+        snprintf(what, sizeof what, "The start screen found parts of your game files that differ from a good copy of "
+                 "version %s: the download they came from was damaged, and the game crashes when it loads them. Get the "
+                 "update (and the base game) again, then Settings > Delete game files on the start screen and set them "
+                 "up again: the setup checks every package now.", dmg);
     } else if (has("svcBreak") && rt_game_data_bad) {  // (the same spot every time: nothing another start would change, #89)
         snprintf(head, sizeof head, "Damaged game data");
         snprintf(what, sizeof what, "The game read data from its files that can't be unpacked, so it stopped. %s"
@@ -174,6 +202,10 @@ void rt_crash_explain(char *out, size_t n, const char *log_path) {
     } else if (has("out of memory") || has("cannot allocate") || has("alloc failed")) {
         snprintf(head, sizeof head, "Out of memory");
         snprintf(what, sizeof what, "Close other programs and try again.");
+    } else if (g_pc && codemods_at(g_pc)) {  // (before the game code's case: a mod's functions are in its tables too)
+        snprintf(head, sizeof head, "A code mod crashed");
+        snprintf(what, sizeof what, "The mod \"%s\" stopped the game: it may be made for another version of the game. "
+                 "Turn its code off on the start screen's Mods page.", codemods_at(g_pc));
     } else if (g_pc && rt_host_fn_name(g_pc, NULL)) {
         snprintf(head, sizeof head, "The game crashed");
         snprintf(what, sizeof what, "This is a bug in %s, not a problem with your game files or PC. %s", app, report);

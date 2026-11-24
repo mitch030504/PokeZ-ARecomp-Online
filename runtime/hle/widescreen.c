@@ -40,31 +40,107 @@ float widescreen_effect_stretch(uint64_t fs_hash) {
 // (runtime/nvn/renderer.m), but a layout pane draws that way too, whatever its size: the speaker-less message box's
 // dark band (622x46 behind the rounded box, "Wow! This looks pretty heavy!...") came out stretched to the window's
 // width, two dark bars beside the box at 32:9 (user 2026-10-20). A layout (ui2d) draw's vertex uniforms hold the
-// projection (floats 0-15), the pane's model-view rows (16-27) and its rect (132-135: width, height, left, top; y up):
-// true when they describe a pane that doesn't cover the screen (such a draw stays in the 16:9 box).
-bool widescreen_ui_pane_partial(const float *u, uint64_t size) {
-    if (!u || size != 560) return false;
-    if (u[15] != 1 || u[12] != 0 || u[13] != 0 || !(u[0] > 0) || u[5] == 0) return false;  // (orthographic projection)
+// projection (floats 0-15), the pane's model-view rows (16-27) and its rect (132-135: width, height, left, top; y up).
+static bool ortho(const float *u) { return u[15] == 1 && u[12] == 0 && u[13] == 0 && u[0] > 0; }  // (the projection's)
+// The pane's bounds on the screen (-1..1 each way; false: not a layout draw).
+bool widescreen_ui_pane_bounds(const float *u, uint64_t size, float lo[2], float hi[2]) {
+    if (!u || size != 560 || !ortho(u) || u[5] == 0) return false;
     float w = u[132], h = u[133], l = u[134], t = u[135];
     if (!(w > 0) || !(h > 0) || !(w < 1e5f) || !(h < 1e5f)) return false;
-    float lo[2] = {1e9f, 1e9f}, hi[2] = {-1e9f, -1e9f};
+    lo[0] = lo[1] = 1e9f, hi[0] = hi[1] = -1e9f;
     for (int i = 0; i < 4; i++) {
         float x = l + (i & 1 ? w : 0), y = t - (i & 2 ? h : 0);
         float X = u[16] * x + u[17] * y + u[19], Y = u[20] * x + u[21] * y + u[23], Z = u[24] * x + u[25] * y + u[27];
         float n[2] = {u[0] * X + u[1] * Y + u[2] * Z + u[3], u[4] * X + u[5] * Y + u[6] * Z + u[7]};
         for (int k = 0; k < 2; k++) lo[k] = fminf(lo[k], n[k]), hi[k] = fmaxf(hi[k], n[k]);
     }
+    return true;
+}
+// F1 > HUD width (vulkan/exec.c): -1 / 1 for a piece on the left / right side of the 16:9 screen, 0 in the middle.
+// A pane by its edges (past 40% of the half-screen, not 10% into the other half: the battle's eye meter, +-35%, stays
+// whole); one wider than the screen (the minimap's map) and text (a 128-byte transform, anchored at its text box: the
+// battle panel's "Lv. 42", -0.71) by their origin, past 40% from the middle (centred messages stay).
+int widescreen_ui_hud_side(const float *u, uint64_t size, bool pane, const float lo[2], const float hi[2]) {
+    float o;
+    if (pane && hi[0] - lo[0] > 2.0f) o = u[0] * u[19] + u[1] * u[23] + u[2] * u[27] + u[3];
+    else if (pane) return lo[0] < -0.4f && hi[0] <= 0.1f ? -1 : hi[0] > 0.4f && lo[0] >= -0.1f ? 1 : 0;
+    else if (u && size == 128 && ortho(u)) o = u[3];
+    else return 0;
+    return o < -0.4f ? -1 : o > 0.4f ? 1 : 0;
+}
+// true for bounds that don't cover the screen: a smaller pane (such a draw stays in the 16:9 box)
+bool widescreen_ui_bounds_partial(const float lo[2], const float hi[2]) {
     return lo[0] > -0.99f || hi[0] < 0.99f || lo[1] > -0.99f || hi[1] < 0.99f;
+}
+bool widescreen_ui_pane_partial(const float *u, uint64_t size) {  // (the uniforms' pane: renderer.m)
+    float lo[2], hi[2];
+    return widescreen_ui_pane_bounds(u, size, lo, hi) && widescreen_ui_bounds_partial(lo, hi);
 }
 
 // Off in rooms that should keep 16:9 framing (interiors, dungeons) -- see widescreen_update.
 static bool g_allowed = true;
 static bool g_indoor;
-// (Link's Awakening only: Pokémon Z-A's camera is always 16:9, so a wider window filled with it was the 16:9 picture
-// stretched - #176, 3440x1440 with aspect = unlocked, za-default.ini's value, and the F1 row hidden since #160)
-bool widescreen_allowed(void) {
-    return g_game_is_la && g_allowed && g_settings.aspect == ASPECT_UNLOCKED && !ENV("LARECOMP_NO_WIDESCREEN");
+// Pokémon Z-A's wider view: its cameras' projection settings (near, far, fovy, aspect, the 1920x1080 screen's bounds:
+// 0x48 bytes) are the key of a view cache, f_70018b4260(cache, ?, settings) (2.0.2) - a view is made per distinct key,
+// with the projection (and the culling frustum) from it. The screen's cameras say 16:9: their key's aspect (+0x20)
+// becomes the window's on the way in, so the view made matches the wider image. Other shapes (render-to-texture
+// cameras) are left alone. Needs game code with entry pads (built with code mods): without them the window stays
+// 16:9 with bars (widescreen_allowed_for).
+static GuestFn za_view_body;
+static float za_written;  // (the last aspect written into a key: a window resize rewrites it)
+static void za_view_lookup(Cpu *c) {
+    float *a = (float *)(uintptr_t)(c->x[2] + 0x20), want = 16.0f / 9.0f * (g_wide > 1.0f ? g_wide : 1.0f);
+    // shortcut: a key widened for an earlier window size other than the last one stays at it; track more if seen
+    if (*a != want && (*a == 16.0f / 9.0f || (za_written > 0 && *a == za_written))) *a = want, za_written = want;
+    za_view_body(c);
 }
+static bool za_view_tried;
+RT_ON_RESET(za_view_reset) { za_view_body = NULL; za_written = 0; za_view_tried = false; }  // (codehooks_reset: the pad)
+
+// The cache's lookup, found by its code (any game version): its key compare (2.0.2 f_70018b5c7c, these first 12
+// instructions: ldrb w8, [x0, #0x6c]; cbz ...; then field by field), the one call to it whose function opens with
+// sub sp, sp, #0x80; stp x29, x30, [sp, #0x30] and keeps the key (mov x21, x2). Each must be the only one: 0 if
+// not, or not found (another build's code: nothing hooked, the window stays 16:9).
+static uint64_t za_view_find(void) {
+    static const uint32_t cmp[12] = {0x3941b008, 0x34000948, 0xb9402008, 0xb9400029, 0x6b09011f, 0x540008c1,
+                                     0xb9402408, 0xb9400429, 0x6b09011f, 0x54000841, 0xb9402808, 0xb9400829};
+    const Module *m = &g_modules[0];
+    const uint32_t *t = (const uint32_t *)(uintptr_t)(m->base + m->text_off);
+    uint64_t n = m->text_size / 4, at = 0, found = 0;
+    int nat = 0, nfound = 0;
+    for (uint64_t i = 0; i + 12 <= n; i++)
+        if (t[i] == cmp[0] && !memcmp(t + i, cmp, sizeof cmp)) at = i, nat++;
+    if (nat != 1) return 0;
+    for (uint64_t i = 0; i < n; i++) {
+        if ((t[i] & 0xFC000000u) != 0x94000000u) continue;  // bl
+        int64_t d = (int32_t)(t[i] << 6) >> 6;
+        if ((int64_t)i + d != (int64_t)at) continue;
+        for (uint64_t s = i; s + 0x80 > i && s > 0; s--)
+            if (t[s] == 0xd10203ff && t[s + 1] == 0xa9037bfd && t[s + 7] == 0xaa0203f5) { found = s, nfound++; break; }
+    }
+    return nfound == 1 ? m->base + m->text_off + found * 4 : 0;
+}
+
+static bool wide_wanted(void) { return g_allowed && g_settings.aspect == ASPECT_UNLOCKED && !ENV("LARECOMP_NO_WIDESCREEN"); }
+
+// (once per boot, and only with the wide view wanted - F1 > Aspect ratio > Unlocked: the search reads all of main's
+// code, ~50 MB, on the present thread, and the hook stays in the game's camera code until the next boot; Original 16:9
+// after it puts the keys back to 16:9)
+static void za_view_hook(void) {
+    if (g_game_is_la || za_view_body || za_view_tried || !wide_wanted()) return;
+    za_view_tried = true;
+    uint64_t a = za_view_find();
+    extern GuestFn codehooks_entry(uint64_t addr, GuestFn to);
+    za_view_body = a ? codehooks_entry(a, za_view_lookup) : NULL;
+    LOG("[widescreen] Pokémon Z-A view hook at %llx: %s\n", (unsigned long long)a, za_view_body ? "on" : "not applied (16:9)");
+}
+
+// (Link's Awakening: its widescreen hooks. Pokémon Z-A: only with its view hook on, and only wider than 16:9, where
+// that widens the camera - before it, a wider window filled was the 16:9 picture stretched: #176, 3440x1440)
+bool widescreen_allowed_for(double w, double h) {
+    return (g_game_is_la || (za_view_body && w * 9 > h * 16)) && wide_wanted();
+}
+
 void widescreen_set_allowed(bool on) { g_allowed = on; }
 
 // Interiors and dungeons use cameras that never load the patched overworld aspect (site 0). Count
@@ -75,6 +151,7 @@ static int g_indoor_streak, g_outdoor_streak;
 RT_ON_RESET(widescreen_reset) { g_indoor = false; g_indoor_streak = g_outdoor_streak = 0; }
 
 void widescreen_frame_end(uint64_t frame) {
+    za_view_hook();
     bool saw = g_site0_frame == frame;
     if (saw) { g_outdoor_streak++; g_indoor_streak = 0; }
     else { g_indoor_streak++; g_outdoor_streak = 0; }
@@ -156,6 +233,7 @@ static bool level_is_interior(void) {
 bool widescreen_frame_boxed(uint64_t frame) {
     static bool last;
     static uint64_t interior_until;  // keep boxing briefly after leaving: the first (dark) frames still show stale sides
+    if (!g_game_is_la) return false;  // (Link's Awakening's rooms and title; Pokémon Z-A: not in play is all it knows)
     bool in = level_is_interior();
     if (in) interior_until = frame + 8;
     // title / file select (not in play): 16:9 screens; the title's logo glow is drawn too large in the wide image

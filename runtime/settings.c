@@ -24,6 +24,7 @@ static const char *const k_screen_filter_keys[N_SCREEN_FILTERS] = {"off", "gameb
 
 unsigned g_gpu_vendor;
 bool g_gpu_dozen;
+bool g_settings_fresh;  // (settings_load found no settings file: a first start)
 bool gpu_feature_on(int feature, const char *env) {
     const char *e = env ? getenv(env) : NULL;
     if (e && *e) return atoi(e) != 0;
@@ -57,9 +58,11 @@ Settings g_settings = {
     .controller_light = true,
     .menu_confirm = MENU_CONFIRM_CONTROLLER,
     .show_fps = false,
+    .mystery_gift = false,  // (F1 > Online > Mystery Gift: on, the game sees a connection and the gift list is fetched)
     .fps60_lock = true,  // ("Drop to 30 fps when needed" off unless the player turns it on)
     .smooth_anim = true,  // (Pokémon Z-A 2.0.2: distant characters animate every frame)
     .camera_distance = 100,
+    .draw_dist = 100,  // (the game's own draw distances: #190's option off)
     .frame_dt = true,    // (Pokémon Z-A: the world step from a wall-clock accumulator - the same speed at any frame rate)
     .tex_hd = true,
     .tex_hd_cache_mb = 512,
@@ -76,6 +79,8 @@ Settings g_settings = {
     .mouse_camera = MOUSE_CAM_CAPTURED,
     .mouse_sens = 1.0f,
     .mouse_aim_camera = true,
+    .lstick_deadzone = 10,
+    .lstick_outer = 90,
     .walk_speed = 1.0f,
     .walk_speed_dungeons = false,
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
@@ -280,7 +285,7 @@ void settings_load(void) {
     if (loaded) return;
     loaded = true;
     FILE *f = fopen(SETTINGS_FILE, "r");
-    if (!f) { settings_env_overrides(); return; }
+    if (!f) { g_settings_fresh = true; settings_env_overrides(); return; }
     char line[1200];
     bool tip_key = false, aspect_key = false, video_key = false;
     while (fgets(line, sizeof line, f)) {
@@ -296,12 +301,14 @@ void settings_load(void) {
         // (the start screen's keys: an empty value is valid - no mods off, no order)
         if (!strcmp(key, "mods_order")) { strlcpy(g_settings.mods_order, val, sizeof g_settings.mods_order); continue; }
         if (!strcmp(key, "mods_off")) { strlcpy(g_settings.mods_off, val, sizeof g_settings.mods_off); continue; }
+        if (!strcmp(key, "mods_code_on")) { strlcpy(g_settings.mods_code_on, val, sizeof g_settings.mods_code_on); continue; }
         if (!strcmp(key, "launcher_language")) {
             g_settings.ui_lang = !strcmp(val, "pt") ? UI_LANG_PT : !strcmp(val, "en") ? UI_LANG_EN : UI_LANG_AUTO;
             continue;
         }
         if (fields != 2) continue;
         if (!strcmp(key, "aspect")) g_settings.aspect = !strcmp(val, "original") ? ASPECT_ORIGINAL : ASPECT_UNLOCKED;
+        else if (!strcmp(key, "hud_width")) { int v = atoi(val); g_settings.hud_width = v < 0 ? 0 : v > 100 ? 100 : v; }
         else if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
         else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
         else if (!strcmp(key, "microphone_gain")) g_settings.mic_gain = (float)atof(val);
@@ -311,11 +318,16 @@ void settings_load(void) {
         else if (!strcmp(key, "reverb")) g_settings.reverb = atoi(val) != 0;
         else if (!strcmp(key, "movie_audio")) g_settings.movie_audio = atoi(val) != 0;
         else if (!strcmp(key, "show_fps")) g_settings.show_fps = atoi(val) != 0;
+        else if (!strcmp(key, "mystery_gift")) g_settings.mystery_gift = atoi(val) != 0;
+        else if (!strcmp(key, "content_stones")) g_settings.content_stones = atoi(val) != 0;
+        else if (!strcmp(key, "content_trade")) g_settings.content_trade = atoi(val) != 0;
         else if (!strcmp(key, "fps60")) g_settings.fps60 = atoi(val) != 0;
         else if (!strcmp(key, "fps60_lock")) g_settings.fps60_lock = atoi(val) != 0;
         else if (!strcmp(key, "frame_dt")) g_settings.frame_dt = atoi(val) != 0;
         else if (!strcmp(key, "smooth_anim")) g_settings.smooth_anim = atoi(val) != 0;
         else if (!strcmp(key, "camera_distance")) { int n = atoi(val); g_settings.camera_distance = n < 50 ? 50 : n > 200 ? 200 : n; }
+        else if (!strcmp(key, "full_detail_models")) g_settings.full_detail = atoi(val) != 0;
+        else if (!strcmp(key, "draw_distance")) g_settings.draw_dist = atoi(val);
         else if (!strcmp(key, "hdr")) g_settings.hdr = atoi(val) != 0;
         else if (!strcmp(key, "hdr_peak_nits")) { int n = atoi(val); g_settings.hdr_peak = n < 200 ? 200 : n > 10000 ? 10000 : n; }
         else if (!strcmp(key, "hdr_paper_white_nits")) { int n = atoi(val); g_settings.hdr_paper = n < 80 ? 80 : n > 500 ? 500 : n; }
@@ -381,6 +393,9 @@ void settings_load(void) {
         else if (!strcmp(key, "mouse_sens")) g_settings.mouse_sens = (float)atof(val);
         else if (!strcmp(key, "mouse_aim_camera")) g_settings.mouse_aim_camera = atoi(val) != 0;
         else if (!strcmp(key, "rstick_snap")) { int d = atoi(val); g_settings.rstick_snap = d < 0 ? 0 : d > 30 ? 30 : d; }
+        else if (!strcmp(key, "lstick_deadzone")) g_settings.lstick_deadzone = atoi(val);
+        else if (!strcmp(key, "lstick_outer")) g_settings.lstick_outer = atoi(val);
+        else if (!strcmp(key, "rstick_deadzone")) g_settings.rstick_deadzone = atoi(val);
         else if (!strcmp(key, "blur_removal")) g_settings.blur_removal = atoi(val) != 0;
         else if (!strcmp(key, "hide_hero_icon")) g_settings.hide_hero_icon = atoi(val) != 0;
         else if (!strcmp(key, "mirror_mode")) g_settings.mirror_mode = atoi(val) != 0;
@@ -443,9 +458,25 @@ void settings_load(void) {
     if (g_settings.volume > 2) g_settings.volume = 2;
     if (!(g_settings.mic_gain >= 0 && g_settings.mic_gain <= 48)) g_settings.mic_gain = 6.0f;
     if (!(g_settings.mouse_sens >= 0.1f && g_settings.mouse_sens <= 5)) g_settings.mouse_sens = 1.0f;
+    if (g_settings.lstick_deadzone < 0 || g_settings.lstick_deadzone > 30) g_settings.lstick_deadzone = 10;
+    if (g_settings.lstick_outer < 70 || g_settings.lstick_outer > 100) g_settings.lstick_outer = 90;
+    if (g_settings.rstick_deadzone < 0 || g_settings.rstick_deadzone > 30) g_settings.rstick_deadzone = 0;
     if (g_settings.rumble_strength < 25 || g_settings.rumble_strength > 100) g_settings.rumble_strength = 100;
+    if (g_settings.draw_dist != 150 && g_settings.draw_dist != 200 && g_settings.draw_dist != 300) g_settings.draw_dist = 100;
     settings_env_overrides();
     LOG("[settings] loaded %s\n", SETTINGS_FILE);
+    {   // F1 > Compatibility choices that aren't Auto, and a chosen graphics card: a report's log shows them (#288 had
+        // robust access 2 on, which Auto keeps off on AMD GPUs, and nothing in its log said so)
+        static const char *const names[GPU_COMPAT_N] = {"gpu_dynamic_vertex", "gpu_overlap", "gpu_straight_shaders", "gpu_xfb_mirror",
+            "gpu_robust_access", "gpu_texture_prefetch", "gpu_prepare_shaders", "gpu_pages_outside"};
+        char line[256] = "";
+        size_t n = 0;
+        for (int i = 0; i < GPU_COMPAT_N && n < sizeof line - 48; i++)
+            if (g_settings.gpu_compat[i] != GPU_AUTO)
+                n += (size_t)snprintf(line + n, sizeof line - n, " %s=%s", names[i], g_settings.gpu_compat[i] == GPU_ON ? "on" : "off");
+        if (n) LOG("[settings] F1 > Compatibility, not Auto:%s\n", line);
+        if (g_settings.gpu_name[0]) LOG("[settings] graphics card chosen in F1: %s\n", g_settings.gpu_name);
+    }
 }
 
 void settings_save(void) {
@@ -453,6 +484,7 @@ void settings_save(void) {
     if (!f) { LOG("[settings] cannot write %s\n", SETTINGS_FILE); return; }
     fprintf(f, "# ZA Recomp settings (edited from the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
     fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_ORIGINAL ? "original" : "unlocked");
+    fprintf(f, "hud_width = %d\n", g_settings.hud_width);
     fprintf(f, "fullscreen = %d\n", g_settings.fullscreen);
     fprintf(f, "volume = %.2f\n", g_settings.volume);
     fprintf(f, "microphone_gain = %.2f\n", g_settings.mic_gain);
@@ -462,11 +494,15 @@ void settings_save(void) {
     fprintf(f, "reverb = %d\n", g_settings.reverb);
     fprintf(f, "movie_audio = %d\n", g_settings.movie_audio);
     fprintf(f, "show_fps = %d\n", g_settings.show_fps);
+    fprintf(f, "mystery_gift = %d\n", g_settings.mystery_gift);
+    fprintf(f, "content_stones = %d\ncontent_trade = %d\n", g_settings.content_stones, g_settings.content_trade);
     fprintf(f, "fps60 = %d\n", g_settings.fps60);
     fprintf(f, "fps60_lock = %d\n", g_settings.fps60_lock);
     fprintf(f, "frame_dt = %d\n", g_settings.frame_dt);
     fprintf(f, "smooth_anim = %d\n", g_settings.smooth_anim);
     fprintf(f, "camera_distance = %d\n", g_settings.camera_distance);
+    fprintf(f, "full_detail_models = %d\n", g_settings.full_detail);
+    fprintf(f, "draw_distance = %d\n", g_settings.draw_dist);
     fprintf(f, "aniso16 = %d\n", g_settings.aniso16);
     fprintf(f, "hdr = %d\n", g_settings.hdr);
     fprintf(f, "hdr_peak_nits = %d\n", g_settings.hdr_peak);
@@ -516,6 +552,8 @@ void settings_save(void) {
     fprintf(f, "controller_light = %d\n", g_settings.controller_light);
     fprintf(f, "background_input = %d\n", g_settings.bg_input);
     fprintf(f, "rstick_snap = %d\n", g_settings.rstick_snap);
+    fprintf(f, "rstick_deadzone = %d\n", g_settings.rstick_deadzone);
+    fprintf(f, "lstick_deadzone = %d\nlstick_outer = %d\n", g_settings.lstick_deadzone, g_settings.lstick_outer);
     fprintf(f, "move_360 = %d\nblur_removal = %d\nhide_hero_icon = %d\n", g_settings.move_360, g_settings.blur_removal,
             g_settings.hide_hero_icon);
     static const char *const prompts[] = {"auto", "nintendo", "xbox", "playstation", "keyboard", "steamdeck"};
@@ -560,7 +598,8 @@ void settings_save(void) {
     if (g_settings.rando_options[0]) fprintf(f, "rando_options = %s\n", g_settings.rando_options);
     static const char *const ui_lang[] = {"auto", "en", "pt"};
     fprintf(f, "launcher_language = %s\n", ui_lang[g_settings.ui_lang <= UI_LANG_PT ? g_settings.ui_lang : 0]);
-    fprintf(f, "mods_order = %s\nmods_off = %s\n", g_settings.mods_order, g_settings.mods_off);
+    fprintf(f, "mods_order = %s\nmods_off = %s\nmods_code_on = %s\n", g_settings.mods_order, g_settings.mods_off,
+            g_settings.mods_code_on);
     fclose(f);
 }
 
@@ -608,6 +647,13 @@ bool settings_list_has(const char *list, const char *name) {
         p = bar ? bar + 1 : NULL;
     }
     return false;
+}
+
+// mods/<name>'s code runs: the mod is on and its code was turned on (the Mods page), or LARECOMP_CODE_MODS=1 (all)
+bool settings_mod_code_on(const char *name) {
+    if (settings_list_has(g_settings.mods_off, name)) return false;
+    const char *e = getenv("LARECOMP_CODE_MODS");
+    return (e && !strcmp(e, "1")) || settings_list_has(g_settings.mods_code_on, name);
 }
 
 /// True on a Steam Deck (DMI vendor "Valve"): "Auto" button icons then use the Deck's own names (L1 R1 L2 R2 L3 R3).

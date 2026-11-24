@@ -2,6 +2,9 @@
 #include "../../runtime/hle/lumiose_network.c"
 #include <assert.h>
 
+Module g_modules[6];
+int g_nmodules;
+
 int main(void) {
     Cpu c = {0};
     lumiose_socket_init(&c);

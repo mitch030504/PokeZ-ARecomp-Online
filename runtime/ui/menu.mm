@@ -20,6 +20,16 @@
 #include "osk.h"
 #include "pad_nav.h"
 #include "lumiose_chat_layout.h"
+extern "C" void launcher_maxlod_kick(void);  // runtime/ui/launcher.mm: F1 > Full-detail models (#190)
+extern "C" int launcher_maxlod_state(void);
+extern "C" bool g_maxlod_on;  // runtime/services/fs.c
+extern "C" void launcher_drawdist_kick(void);  // F1 > Draw distance (#190)
+extern "C" int launcher_drawdist_state(void);
+extern "C" int mystery_gift_support(void);  // runtime/hle/mystery_gift.c: 1 this game version can, 0 it cannot, -1 no game loaded
+extern "C" bool g_drawdist_on;
+extern "C" void launcher_content_kick(void);  // F1 > Content
+extern "C" int launcher_content_state(void);
+extern "C" bool g_content_on;
 #ifdef __APPLE__
 #include "imgui_impl_metal.h"
 #else
@@ -36,6 +46,7 @@ extern "C" int vk_gpu_names(const char **names, int max);  // device.c: the Vulk
 extern "C" {
 #include "../hle.h"
 #include "../settings.h"
+#include "../bugrec.h"
 extern int g_game_is_la;  // runtime/kernel.c: Link's Awakening (its own tabs: randomizer, warp, cheats...)
 extern const char *g_save_dir;
 #include "menu.h"
@@ -100,6 +111,51 @@ extern "C" void menu_notice(const char *text, int seconds) {
 
 bool menu_is_open(void) { return g_open.load(); }
 static void set_open(bool open);
+
+// Options read only when the game starts (their rows say "from the next start"): in game, a change to them stays
+// pending until the player applies it - F1 shows it at the top with Apply / Discard, closing F1 with one pending asks,
+// and once applied F1 says a restart is needed. (On the start screen they all apply at Play: nothing pending there.)
+// The values when F1 opened (or when last applied) are the ones this session runs with or will start with.
+struct RestartSnap {
+    int gpu_compat[GPU_COMPAT_N];
+    char gpu_name[256];
+    int video_rec, opmode, shadow_res, language, draw_dist;
+    bool dx12, full_detail;
+};
+static RestartSnap g_rs;      // (taken when F1 opens in game, and on Apply)
+static bool g_rs_taken;       // (F1 opened in game this session)
+static bool g_rs_applied;     // (something was applied: a restart is needed)
+static bool g_rs_ask;         // (closing with changes pending: the question, next frame)
+static void rs_take(RestartSnap *r) {
+    memset(r, 0, sizeof *r);
+    memcpy(r->gpu_compat, g_settings.gpu_compat, sizeof r->gpu_compat);
+    memcpy(r->gpu_name, g_settings.gpu_name, sizeof r->gpu_name);
+    r->video_rec = g_settings.video_rec, r->opmode = g_settings.opmode, r->shadow_res = g_settings.shadow_res;
+    r->language = g_settings.language, r->dx12 = g_settings.dx12, r->full_detail = g_settings.full_detail;
+    r->draw_dist = g_settings.draw_dist;
+}
+static void rs_put(const RestartSnap *r) {
+    memcpy(g_settings.gpu_compat, r->gpu_compat, sizeof r->gpu_compat);
+    memcpy(g_settings.gpu_name, r->gpu_name, sizeof r->gpu_name);
+    g_settings.video_rec = r->video_rec, g_settings.opmode = r->opmode, g_settings.shadow_res = r->shadow_res;
+    g_settings.language = r->language, g_settings.dx12 = r->dx12, g_settings.full_detail = r->full_detail;
+    g_settings.draw_dist = r->draw_dist;
+}
+static bool rs_pending(void) {
+    if (!g_rs_taken) return false;
+    RestartSnap now;
+    rs_take(&now);
+    return memcmp(&now, &g_rs, sizeof now) != 0;
+}
+static void rs_apply(void) {
+    rs_take(&g_rs);
+    g_rs_applied = true;
+    settings_save();
+    LOG("[menu] options for the next start applied (a restart is needed)\n");
+    menu_notice(TR("Saved: restart the game for these changes to take effect.",
+                   "Salvo: reinicie o jogo para essas mudanças valerem."), 6);
+}
+static void rs_discard(void) { rs_put(&g_rs); settings_save(); }
 extern "C" void menu_test_open(void) {
     set_open(true);
     if (getenv("LARECOMP_MENU_TAB")) { extern int g_tab_request_ext; g_tab_request_ext = atoi(getenv("LARECOMP_MENU_TAB")); }
@@ -108,6 +164,10 @@ extern "C" void menu_test_open(void) {
 void menu_tabs_focus(bool first_tab);
 static void set_open(bool open) {
     if (open == g_open.load()) return;
+    if (!open && rs_pending()) { g_rs_ask = true; return; }  // (F1 stays open: the question first)
+    if (open && !g_rs_taken) rs_take(&g_rs), g_rs_taken = true;
+    if (open && getenv("LARECOMP_TEST_RESTART_CHANGE"))  // (test: an option for the next start changed as F1 opens)
+        g_settings.full_detail = !g_rs.full_detail;
     g_open.store(open);
     input_reset();  // nothing held while the menu had focus leaks into the game
     bind_capture_cancel();
@@ -564,12 +624,22 @@ static void tab_display(bool in_game) {
     }
 #endif
     const char *aspects[] = {TR("Unlocked", "Livre"), TR("Original 16:9", "16:9 original")};
-    if (la)  // (Link's Awakening's widescreen hooks only: Pokémon Z-A always draws 16:9, the row did nothing there, #160)
+    // (Pokémon Z-A: wider than 16:9 only, with its view hook - runtime/hle/widescreen.c; a taller window keeps bars)
     opt_choice(TR("Aspect ratio", "Proporção"), &g_settings.aspect, aspects, 2, ASPECT_UNLOCKED,
                TR("Unlocked: the view fills the window, so wider (or taller) windows show more of the world - up to "
                   "ultrawide. Original 16:9: the game's own framing, with bars.",
                   "Livre: a imagem ocupa a janela toda, então janelas mais largas (ou mais altas) mostram mais do mundo "
                   "- até ultrawide. 16:9 original: o enquadramento do próprio jogo, com barras."));
+    if (!la && g_settings.aspect == ASPECT_UNLOCKED)  // (Pokémon Z-A: its HUD is boxed 16:9 - vulkan/exec.c moves it out)
+        opt_int(TR("HUD width", "Largura do HUD"), &g_settings.hud_width, 0, 100, 10, 0, "%d%%",
+                TR("In a window wider than 16:9: how far the HUD's corners move out towards the window's sides. 16:9: "
+                   "the HUD as the game lays it out, in the middle. 100%: at the window's edges. Menus stay in the middle. "
+                   "Markers over characters and places near the sides (name tags, quest markers) move with the HUD.",
+                   "Numa janela mais larga que 16:9: quanto os cantos do HUD se afastam para os lados da janela. 16:9: "
+                   "o HUD como o jogo o dispõe, no meio. 100%: nas bordas da janela. Os menus ficam no meio. "
+                   "Marcadores sobre personagens e lugares perto das laterais (nomes, marcadores de missão) se movem "
+                   "com o HUD."),
+                "16:9");
     bool fs = g_settings.fullscreen;
     if (opt_toggle(TR("Fullscreen", "Tela cheia"), &fs, false,
                    TR("Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.", "Ocupa a tela toda. Também: F11, Alt+Enter ou Cmd+Ctrl+F."))) {
@@ -615,11 +685,13 @@ static void tab_display(bool in_game) {
                 g_settings.fps60_lock = !fall;
             ImGui::EndDisabled();
             opt_toggle(TR("Constant game speed", "Velocidade constante"), &g_settings.frame_dt, true,
-                       TR("The world runs at the same speed at any frame rate: the game's step comes from the time that "
-                          "really passed, so 50 fps plays at full speed, not in slow motion. Off: the game's own step - "
-                          "below the chosen rate everything moves in slow motion. Applies from the next frame.",
-                          "O mundo roda na mesma velocidade em qualquer taxa de quadros: o passo do jogo vem do tempo que "
-                          "realmente passou, então 50 fps joga em velocidade normal, não em câmera lenta. Desligado: o "
+                       TR("The world runs at the same speed from 30 to 60 fps: the game's step comes from the time that "
+                          "really passed, so 50 fps plays at full speed, not in slow motion. Below 30 fps it slows down, "
+                          "as on the Switch (bigger steps make dash moves miss). Off: the game's own step - below the "
+                          "chosen rate everything moves in slow motion. Applies from the next frame.",
+                          "O mundo roda na mesma velocidade de 30 a 60 fps: o passo do jogo vem do tempo que realmente "
+                          "passou, então 50 fps joga em velocidade normal, não em câmera lenta. Abaixo de 30 fps fica "
+                          "mais lento, como no Switch (passos maiores fazem golpes de investida errarem). Desligado: o "
                           "passo do próprio jogo - abaixo da taxa escolhida tudo fica em câmera lenta. Vale a partir do "
                           "próximo quadro."));
             opt_toggle(TR("Smooth distant animation", "Animação suave à distância"), &g_settings.smooth_anim, true,
@@ -628,6 +700,48 @@ static void tab_display(bool in_game) {
                           "Personagens e Pokémon longe da câmera animam a cada quadro, como os que estão perto, em vez de "
                           "em passos visíveis. Custa um pouco de CPU em lugares cheios. Desligado: o do próprio jogo. "
                           "Apenas na versão 2.0.2 do jogo."));
+            {   // #190: cache/maxlod (runtime/ui/launcher.mm launcher_maxlod_kick), layered from the next start
+                bool was = g_settings.full_detail;
+                opt_toggle(TR("Full-detail models", "Modelos sempre detalhados"), &g_settings.full_detail, false,
+                           TR("Characters, Pokémon and buildings keep their full detail at any distance, instead of the "
+                              "simpler versions the game swaps in far away (less visible popping as you walk). Costs some "
+                              "GPU time in crowded places. Made from your own game files the first time (about 2 "
+                              "minutes, in the background); applies from the next start.",
+                              "Personagens, Pokémon e construções ficam com todo o detalhe a qualquer distância, em vez "
+                              "das versões mais simples que o jogo troca de longe (menos troca visível enquanto anda). "
+                              "Custa um pouco de GPU em lugares cheios. Feito a partir dos seus próprios arquivos do jogo "
+                              "na primeira vez (cerca de 2 minutos, em segundo plano); vale a partir da próxima abertura."));
+                if (g_settings.full_detail && !was) launcher_maxlod_kick();
+                int st = g_settings.full_detail ? launcher_maxlod_state() : 0;
+                if (st == 1)
+                    ImGui::TextColored(ImVec4(0.95f, 0.71f, 0.27f, 1), "%s",
+                                       TR("Preparing the full-detail models...", "Preparando os modelos detalhados..."));
+                else if (st == 2 && in_game && !g_maxlod_on)
+                    ImGui::TextDisabled("%s", TR("Ready: applies from the next start.", "Pronto: vale a partir da próxima abertura."));
+            }
+            {   // #190: cache/drawdist (runtime/ui/launcher.mm launcher_drawdist_kick), layered from the next start
+                static const int pcts[] = {100, 150, 200, 300};
+                int di = 0;
+                for (int i = 1; i < 4; i++) if (g_settings.draw_dist == pcts[i]) di = i;
+                const char *dd[] = {TR("Game's", "Do jogo"), "1.5x", "2x", "3x"};
+                int was = g_settings.draw_dist;
+                if (opt_choice(TR("Draw distance", "Distância de visão"), &di, dd, 4, 0,
+                               TR("How far away objects, people and Pokémon are drawn and keep their detail: the game's "
+                                  "own distances (people's simpler versions from 8 m, objects hidden past 65 or 130 m) "
+                                  "times this. Less popping in as you walk; costs GPU time in busy places. Made from your "
+                                  "own game files (a few seconds, in the background); applies from the next start.",
+                                  "A que distância objetos, pessoas e Pokémon são desenhados e mantêm o detalhe: as "
+                                  "distâncias do próprio jogo (versões simples das pessoas a partir de 8 m, objetos "
+                                  "escondidos depois de 65 ou 130 m) vezes este valor. Menos coisas surgindo enquanto "
+                                  "anda; custa GPU em lugares cheios. Feito a partir dos seus arquivos do jogo (alguns "
+                                  "segundos, em segundo plano); vale a partir da próxima abertura.")))
+                    g_settings.draw_dist = pcts[di];
+                if (g_settings.draw_dist != was) launcher_drawdist_kick();
+                int st = launcher_drawdist_state();
+                if (g_settings.draw_dist != 100 && st == 1)
+                    ImGui::TextColored(ImVec4(0.95f, 0.71f, 0.27f, 1), "%s",
+                                       TR("Preparing the draw distance...", "Preparando a distância de visão..."));
+            }
             if (in_game && g_settings.fps60 && g_fps60_fell_back)
                 ImGui::TextColored(ImVec4(0.95f, 0.71f, 0.27f, 1), "%s",
                                    TR("Running at 30 fps: this PC didn't keep 60 fps.", "Rodando a 30 fps: este PC não segurou 60 fps."));
@@ -929,7 +1043,13 @@ static void tab_display(bool in_game) {
     if (!la) {  // (runtime/nvn/vulkan/exec.c fsr2_copy: applies at once)
         int t = g_settings.taa;
         const char *taa[] = {TR("Game's", "Do jogo"), "AMD FSR 2", "NVIDIA DLAA", "AMD FSR 3.1", "AMD FSR 4.1.2"};  // (TAA_*)
-        if (opt_choice(TR("Temporal anti-aliasing", "Anti-aliasing temporal"), &t, taa, 5, 0,
+#ifdef __linux__
+        const int n_taa = 5;  // (FSR 4.1.2: Linux only, a user-supplied provider - fsr4.cpp)
+#else
+        const int n_taa = 4;
+        if (t == TAA_FSR4) t = TAA_FSR3;  // (an ini from Linux: exec.c taa_kind runs FSR 3.1 for it here)
+#endif
+        if (opt_choice(TR("Temporal anti-aliasing", "Anti-aliasing temporal"), &t, taa, n_taa, 0,
                        TR("AMD FSR or NVIDIA DLAA in place of the game's own edge smoothing: they combine several frames, "
                           "so fences, railings, leaves and thin lines stay smooth and stop flickering as you move. Uses a "
                           "little GPU time. FSR 3.1 leaves less of a trail behind moving things than FSR 2 (FSR 2 if its DLL is "
@@ -1173,6 +1293,7 @@ static void tab_quit(float scale, bool in_game) {
         if (opt_action(ask == 1 ? TR("Yes, quit to Start Screen", "Sim, sair para a tela inicial")
                                 : TR("Yes, quit to Desktop", "Sim, sair para a área de trabalho"), "", ask == 1 ? d1 : d2)) {
             settings_save();
+            rs_take(&g_rs);  // (leaving the game: what's set now applies at the next Play - nothing to ask)
             if (ask == 1) {
                 rt_request_reboot(2);
                 set_open(false);
@@ -1189,6 +1310,164 @@ static void tab_quit(float scale, bool in_game) {
 }
 
 // Pokémon Z-A's Game page: its text language, and how to reach this menu
+// F1 > Online (experimental, runtime/services/net.c): link trades and battles with a friend over the internet. Each
+// player copies their connection code, sends it (WhatsApp, Discord...) and pastes the friend's: both games then reach
+// each other directly (no server), and Link Play > Nearby Players finds the friend as if on the same network - as
+// often as wanted while the game runs.
+extern "C" void net_online_open(void);
+extern "C" bool net_online_code(char *out, size_t n);
+extern "C" int net_online_connect(const char *code);
+extern "C" int net_online_status(char *out, size_t n);
+extern "C" int net_online_nat(void);
+extern "C" bool net_inet_time_synced(void);  // (net_inet.c: network time known - the PCs' clocks don't matter)
+static void tab_online(void) {
+    static bool opened;
+    if (!opened) opened = true, net_online_open();  // (the transport, on a port of its own, and our public address)
+    static char note[96];  // what the last paste did
+    static uint64_t copied_at, pasted_at;  // pasted_at: the friend's code, for "didn't connect" after 2 minutes
+    char code[48] = {0};
+    bool have = net_online_code(code, sizeof code);
+    char peers[512];
+    int live = net_online_status(peers, sizeof peers);
+    opt_begin("##online", ImGui::GetFontSize() / 34);
+    opt_section(TR("Play with a friend over the internet (test)", "Jogar com um amigo pela internet (teste)"));
+    opt_disable_next();  // (a notice: this feature is a test - it may change or go away in a later version)
+    opt_action(TR("Test feature", "Recurso em teste"), TR("may change or be removed", "pode mudar ou ser removido"),
+               TR("Online play is a test in this version: link trades and private battles with a friend, game to game, "
+                  "with no server. It may not connect on every network, and it may change or be removed in a later "
+                  "version. Your save is not sent anywhere.",
+                  "O jogo online é um teste nesta versão: trocas e batalhas privadas com um amigo, de jogo para jogo, "
+                  "sem servidor. Pode não conectar em todas as redes, e pode mudar ou ser removido numa versão futura. "
+                  "O seu save não é enviado para lugar nenhum."), false);
+    bool just_copied = copied_at && SDL_GetTicks() - copied_at < 2500;
+    if (!have) opt_disable_next();
+    if (opt_action(TR("Your code", "Seu código"), have ? (just_copied ? TR("Copied!", "Copiado!") : code)
+                                                       : TR("Finding your address...", "Descobrindo seu endereço..."),
+                   TR("Copy it (A / click) and send it to your friend. Share it only with who you'll play with: it "
+                      "carries your internet address. It's valid while the game stays open.",
+                      "Copie (A / clique) e mande para o seu amigo. Compartilhe só com quem vai jogar com você: ele "
+                      "leva o seu endereço de internet. Vale enquanto o jogo estiver aberto."), false)) {
+        SDL_SetClipboardText(code);
+        copied_at = SDL_GetTicks();
+    }
+    if (opt_action(TR("Paste friend's code", "Colar código do amigo"), note[0] ? note : "",
+                   TR("Copy your friend's code, then choose this: it's read from the clipboard. Both of you paste "
+                      "the other's code - that is what lets the two connections through.",
+                      "Copie o código do seu amigo e escolha esta opção: ele é lido da área de transferência. Os dois "
+                      "colam o código um do outro - é isso que deixa as duas conexões passarem."), false)) {
+        char *clip = SDL_GetClipboardText();
+        int r = clip ? net_online_connect(clip) : 0;
+        if (r > 0) pasted_at = SDL_GetTicks();
+        snprintf(note, sizeof note, "%s", r > 0 ? TR("Connecting...", "Conectando...")
+                                          : r < 0 ? TR("That's your own code", "Esse é o seu próprio código")
+                                                  : TR("No code in the clipboard", "Nenhum código copiado"));
+        SDL_free(clip);
+    }
+    // Not connected 2 minutes after the friend's code (hole punching tries once a minute, and the friend may
+    // paste later: net_inet_punch): say why when we know it (this PC's NAT gives a new port per
+    // destination - the address in our code is useless to the friend), and what works anyway - a virtual LAN (Radmin
+    // VPN, ZeroTier, Hamachi): the two games then find each other as on one network, no codes needed
+    bool failed = !live && pasted_at && SDL_GetTicks() - pasted_at > 120000;
+    int nat = net_online_nat();
+    char st[64];
+    if (live) snprintf(st, sizeof st, TR("Connected (%d)", "Conectado (%d)"), live);
+    else if (failed) snprintf(st, sizeof st, "%s", TR("Didn't connect", "Não conectou"));
+    else snprintf(st, sizeof st, "%s", pasted_at ? TR("Waiting for your friend", "Esperando o seu amigo") : "-");
+    const char *vpn_en = "Radmin VPN, ZeroTier or Hamachi: install the same one, join the same network, and Link Play > "
+                         "Nearby Players finds your friend as if you were at the same place - no codes needed.";
+    const char *vpn_pt = "Radmin VPN, ZeroTier ou Hamachi: instalem o mesmo, entrem na mesma rede, e o Link Play > Nearby "
+                         "Players acha o seu amigo como se vocês estivessem no mesmo lugar - sem precisar de código.";
+    char why[640];
+    if (live)
+        snprintf(why, sizeof why, "%s", TR("Connected. Now open Link Play > Nearby Players (Link Trade or Private Battles) in the "
+                                           "game, both of you with the same link code / room.",
+                                           "Conectado. Agora abram Link Play > Nearby Players (Link Trade ou Private Battles) no "
+                                           "jogo, os dois com o mesmo código de troca / sala."));
+    else if (failed && nat == 2)
+        snprintf(why, sizeof why, TR("Your internet connection gives each destination a different port (a \"symmetric\" NAT, "
+                                     "common on mobile data), so your friend can't reach the address in your code. Try "
+                                     "another connection (home Wi-Fi instead of mobile data), or a virtual network: %s",
+                                     "A sua conexão usa uma porta diferente para cada destino (NAT \"simétrico\", comum em "
+                                     "dados móveis), então o seu amigo não consegue chegar no endereço do seu código. Tente "
+                                     "outra conexão (Wi-Fi de casa em vez de dados móveis) ou uma rede virtual: %s"),
+                 TR(vpn_en, vpn_pt));
+    else if (failed && net_inet_time_synced())  // (network time: the PCs' clocks don't matter)
+        snprintf(why, sizeof why, TR("Check that both of you pasted the other's code (new codes after a game restart). If it still doesn't "
+                                     "connect, one of your networks blocks direct connections - use a virtual network: %s",
+                                     "Confiram se os dois colaram o código um do outro (o código muda quando o jogo reinicia). Se ainda não "
+                                     "conectar, a rede de um de vocês bloqueia conexões diretas - usem uma rede virtual: %s"),
+                 TR(vpn_en, vpn_pt));
+    else if (failed)
+        snprintf(why, sizeof why, TR("Check that both of you pasted the other's code (new codes after a game restart) and that both PCs show the "
+                                     "right time, to the second (Windows: Sync now). If it still doesn't connect, one of your networks blocks direct connections - use a virtual "
+                                     "network: %s",
+                                     "Confiram se os dois colaram o código um do outro (o código muda quando o jogo reinicia) e se os dois PCs "
+                                     "estão com a hora certa, nos segundos (Windows: Sincronizar agora). Se ainda não conectar, a rede de um de vocês bloqueia conexões diretas - usem uma rede "
+                                     "virtual: %s"),
+                 TR(vpn_en, vpn_pt));
+    else
+        snprintf(why, sizeof why, "%s", TR("Once both codes are pasted, this says Connected, usually within a minute.",
+                                           "Com os dois códigos colados, aqui aparece Conectado, normalmente em até um minuto."));
+    opt_disable_next();
+    opt_action(TR("Status", "Situação"), st, why, false);
+    (void)peers;
+    // Mystery Gift without Nintendo's servers (runtime/services/bcat.c, mystery_gift_cards.c, hle/mystery_gift.c)
+    opt_section(TR("Mystery Gift", "Presente Misterioso"));
+    if (mystery_gift_support() == 0) {  // (#316: a version whose login step isn't found would crash there)
+        opt_disable_next();
+        bool off = false;
+        opt_toggle(TR("Get via Internet", "Receber pela internet"), &off, false,
+                   TR("Not available for this version of the game yet. The game sees no internet connection (as before).",
+                      "Ainda não disponível nesta versão do jogo. O jogo não vê conexão com a internet (como antes)."));
+    } else {
+        opt_toggle(TR("Get via Internet", "Receber pela internet"), &g_settings.mystery_gift, false,
+                   TR("Link Play > Mystery Gift > Get via Internet lists every gift in Project Pokémon's EventsGallery, past "
+                      "and present, downloaded to this PC (cache/mystery_gift); nothing goes to Nintendo. Off: the game sees "
+                      "no internet connection (as before).",
+                      "Modo Conexão > Presente Misterioso > Receber pela internet lista todos os presentes do EventsGallery "
+                      "do Project Pokémon, antigos e atuais, baixados neste PC (cache/mystery_gift); nada vai para a "
+                      "Nintendo. Desligado: o jogo não vê conexão com a internet (como antes)."));
+    }
+    opt_end();
+}
+
+// Content the console only hands out through Nintendo's servers, made available in the game itself
+// (tools/za/content_mod.py on the player's own files: runtime/ui/launcher.mm launcher_content_kick, runtime/services/fs.c)
+static void tab_content(bool in_game) {
+    opt_begin("##content", ImGui::GetFontSize() / 34);
+    bool stones = g_settings.content_stones, trade = g_settings.content_trade;
+    opt_section(TR("Online-only content", "Conteúdo só online"));
+    opt_toggle(TR("Ranked Mega Stones in the shop", "Megapedras das ranqueadas na loja"), &g_settings.content_stones, false,
+               TR("Greninjite, Delphoxite, Chesnaughtite, Baxcalibrite, Sceptilite, Swampertite and Blazikenite are only "
+                  "given as Ranked Battle rewards, which need Nintendo's servers. On: Quasartico Inc.'s Mega Shard "
+                  "exchange sells them from the day it opens, 360 Mega Shards each. Made from your own game files; "
+                  "applies from the next start.",
+                  "Greninjite, Delphoxite, Chesnaughtite, Baxcalibrite, Sceptilite, Swampertite e Blazikenite só são "
+                  "dadas como recompensa das Batalhas Ranqueadas, que precisam dos servidores da Nintendo. Ligado: a "
+                  "troca de Megafragmentos da Quasartico Inc. vende todas desde que abre, por 360 Megafragmentos cada. "
+                  "Feito a partir dos seus arquivos do jogo; vale a partir da próxima abertura."));
+    opt_toggle(TR("Trade evolutions without trading", "Evoluções por troca sem trocar"), &g_settings.content_trade, false,
+               TR("Pokémon that evolve when traded (Kadabra, Haunter, Machoke, Phantump, Pumpkaboo...) also evolve at "
+                  "level 40; those that evolve when traded holding an item (Onix and Scyther with a Metal Coat, "
+                  "Slowpoke with a King's Rock...) can evolve while holding it: the evolve icon appears, day or night. "
+                  "Inkay, which needs the console held upside down, evolves at level 30 as it is. "
+                  "After the \"No More Trade Evolutions\" mod's rules. Trading still works. Made from your own game "
+                  "files; applies from the next start.",
+                  "Pokémon que evoluem por troca (Kadabra, Haunter, Machoke, Phantump, Pumpkaboo...) também evoluem no "
+                  "nível 40; os que evoluem por troca segurando um item (Onix e Scyther com Revestimento Metálico, "
+                  "Slowpoke com Pedra do Rei...) podem evoluir segurando o item: o ícone de evolução aparece, de dia ou "
+                  "de noite. Inkay, que precisa do console de cabeça para baixo, evolui no nível 30 normalmente. "
+                  "Segue as regras do mod \"No More Trade Evolutions\". A troca continua funcionando. Feito "
+                  "a partir dos seus arquivos do jogo; vale a partir da próxima abertura."));
+    if (stones != g_settings.content_stones || trade != g_settings.content_trade) settings_save(), launcher_content_kick();
+    int st = launcher_content_state();
+    if ((g_settings.content_stones || g_settings.content_trade) && st == 1)
+        ImGui::TextColored(ImVec4(0.95f, 0.71f, 0.27f, 1), "%s", TR("Preparing...", "Preparando..."));
+    else if ((g_settings.content_stones || g_settings.content_trade) && st == 2 && in_game && !g_content_on)
+        ImGui::TextDisabled("%s", TR("Ready: applies from the next start.", "Pronto: vale a partir da próxima abertura."));
+    opt_end();
+}
+
 static void tab_game(void) {
     opt_begin("##game", ImGui::GetFontSize() / 34);
     opt_section(TR("Game", "Jogo"));  // (its button icons: the Controls tab, with the rest of the controller)
@@ -1203,6 +1482,13 @@ static void tab_game(void) {
                       "Start Screen, then Play. (A translation mod, like a PT-BR one, goes in Mods on the start screen.)",
                       "O idioma dos textos do jogo, como a configuração do próprio sistema. Vale quando o jogo reinicia: "
                       "Sair > Tela inicial, depois Jogar. (Um mod de tradução, como o PT-BR, vai em Mods na tela inicial.)"));
+    }
+    if (bugrec_active()) {  // (recording for a bug report, runtime/bugrec.c: F8's mark for controller players)
+        opt_section(TR("Bug report", "Relatar um bug"));
+        if (opt_button(TR("Mark the bug now", "Marcar o bug agora"),
+                       TR("The replay stops here (F8 does the same). Then close the game: the zip is in the bug-reports folder.",
+                          "A reprodução para aqui (F8 faz o mesmo). Depois feche o jogo: o zip fica na pasta bug-reports.")))
+            bugrec_mark();
     }
     opt_section(TR("This menu", "Este menu"));
     opt_button(TR("Shortcuts", "Atalhos"),
@@ -1255,6 +1541,7 @@ static void fps_note(double now, float dt) {
 
 // Reboot (runtime/main.c): the game is gone - menu and name dialog close; the ImGui context stays.
 RT_ON_RESET(menu_reset) {
+    g_rs_taken = g_rs_applied = g_rs_ask = false;  // (a new session: its own start values, taken at the next F1)
     set_open(false);
     g_kbd = 0;
     osk_cancel();
@@ -1346,14 +1633,15 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
                        TR("Type a chat message", "Digite uma mensagem") : TR("Enter your name", "Digite seu nome"));
     ImGui::PopFont();
     static bool was_open, was_pad;
-    // A connected pad gets the on-screen keyboard even if Steam Input also sends keyboard events (the last event would
-    // otherwise flip the dialog to keyboard mode and leave the pad's buttons doing nothing).
     // LARECOMP_KBD_KEYBOARD=1: type with the physical keyboard even while a pad is connected.
+    // A connected controller gets the on-screen keyboard even when the last event was a key (#242: Steam Input sends
+    // a pad's presses as keys, and the field then ignored the pad); the on-screen keyboard takes typed text too
+    // (osk.mm), so a player typing on the keyboard loses nothing. LARECOMP_KBD_KEYBOARD=1: the plain field always.
     bool pad = !getenv("LARECOMP_KBD_KEYBOARD") && !g_kbd_chat.load() && (g_last_pad.load() || SDL_HasGamepad()),
-         appearing = !was_open || pad != was_pad;
+         appearing = !was_open || pad != was_pad;  // (switching device: focus the new one)
     was_open = true, was_pad = pad;
     if (!pad) {  // keyboard: type straight into the field
-        if (appearing) ImGui::SetKeyboardFocusHere();
+        if (appearing || !ImGui::IsAnyItemActive()) ImGui::SetKeyboardFocusHere();
         ImGui::SetNextItemWidth(-1);
         ImGui::PushFont(g_font_big);
         ImGui::InputText("##name", g_kbd_text, (size_t)(g_kbd_max * 4 + 1 < (int)sizeof g_kbd_text ? g_kbd_max * 4 + 1 : sizeof g_kbd_text),
@@ -1465,10 +1753,10 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     if (prelaunch) tabs[ntabs++] = {TR("Files", "Arquivos"), -1, true};
     if (!menu_la_tabs) {
         const char *names[] = {TR("Controls", "Controles"), TR("Video", "Vídeo"), TR("Audio", "Áudio"), TR("Game", "Jogo"),
-                               TR("Quit", "Sair")};
-        static const int ids[] = {8, 0, 1, 10, 9};
-        for (int i = 0; i < 5; i++)
-            if (ids[i] != 9 || !prelaunch) tabs[ntabs++] = {names[i], ids[i], true};
+                               TR("Content", "Conteúdo"), "Online", TR("Quit", "Sair")};
+        static const int ids[] = {8, 0, 1, 10, 12, 11, 9};
+        for (int i = 0; i < 7; i++)
+            if ((ids[i] != 9 || !prelaunch) && (ids[i] != 11 || in_game)) tabs[ntabs++] = {names[i], ids[i], true};
     } else {
         static const char *names[] = {"Video", "Audio", "Save Editor", "Randomizer", "Warp", "Cheats", "Gameplay",
                                       "Cosmetics", "Controls", "Quit"};
@@ -1532,6 +1820,46 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     ImGuiWindow *root = ImGui::GetCurrentWindow()->RootWindow;
     static bool nav_in_page;  // (the frame before: the cursor on a control of the page - its child windows)
     if (nav_in_page && g.NavJustMovedToId && g.NavWindow == root && !any_popup) g_focus_tab = -100, g_focus_frames = 0;
+    if (in_game) {  // options for the next start (RestartSnap): pending / applied, and the question on closing
+        static const ImVec4 gold(0.95f, 0.71f, 0.27f, 1);
+        if (rs_pending()) {
+            ImGui::TextColored(gold, "%s", TR("Some changes only take effect after restarting the game and aren't applied yet.",
+                                              "Algumas mudanças só valem depois de reiniciar o jogo e ainda não foram aplicadas."));
+            if (ImGui::Button(TR("Apply (after restart)", "Aplicar (ao reiniciar)"))) rs_apply();
+            ImGui::SameLine();
+            if (ImGui::Button(TR("Discard", "Descartar"))) rs_discard();
+            ImGui::Separator();
+        } else if (g_rs_applied) {
+            ImGui::TextColored(gold, "%s", TR("Changes saved: restart the game for them to take effect (Quit > Start screen, then Play).",
+                                              "Mudanças salvas: reinicie o jogo para elas valerem (Sair > Tela inicial, depois Jogar)."));
+            ImGui::Separator();
+        }
+        if (g_rs_ask) { g_rs_ask = false; ImGui::OpenPopup("###restart_ask"); }
+        ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        if (ImGui::BeginPopupModal(TR("Apply changes?###restart_ask", "Aplicar mudanças?###restart_ask"), NULL,
+                                   ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+            ImGui::TextUnformatted(TR("You changed options that only take effect after restarting the game.\n"
+                                      "Apply them? They'll be used from the next start.",
+                                      "Você mudou opções que só valem depois de reiniciar o jogo.\n"
+                                      "Aplicar? Elas serão usadas a partir da próxima abertura."));
+            ImGui::Spacing();
+            int pick = 0;
+            if (ImGui::Button(TR("Apply", "Aplicar"))) pick = 1;
+            ImGui::SameLine();
+            if (ImGui::Button(TR("Discard", "Descartar"))) pick = 2;
+            ImGui::SameLine();
+            if (ImGui::Button(TR("Back", "Voltar")) || ImGui::IsKeyPressed(ImGuiKey_Escape) ||
+                ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight))
+                pick = 3;
+            if (pick) {
+                ImGui::CloseCurrentPopup();
+                if (pick == 1) rs_apply();
+                if (pick == 2) rs_discard();
+                if (pick != 3) set_open(false);  // (nothing pending now: F1 closes)
+            }
+            ImGui::EndPopup();
+        }
+    }
     if (ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_NoTabListScrollingButtons)) {
         for (int k = 0; k < ntabs; k++) {
             const Tab &t = tabs[k];
@@ -1596,6 +1924,8 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 case 8: controls_tab_draw(scale); break;
                 case 9: tab_quit(scale, in_game); break;
                 case 10: tab_game(); break;
+                case 11: tab_online(); break;
+                case 12: tab_content(in_game); break;
                 }
                 static const char *scroll_test = getenv("LARECOMP_MENU_SCROLL");  // test hook: page scroll, 0..1
                 if (scroll_test) ImGui::SetScrollY(ImGui::GetScrollMaxY() * (float)atof(scroll_test));

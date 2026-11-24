@@ -1,7 +1,7 @@
 #include "../../runtime/hle/swkbd.c"
 #include <assert.h>
 
-Module g_modules[4];
+Module g_modules[6];
 int g_nmodules;
 const char *g_save_dir = "";
 static int seen_limit;

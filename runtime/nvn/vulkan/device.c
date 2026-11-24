@@ -260,6 +260,8 @@ static void pick_device(void) {
     VkPhysicalDevice *pd = calloc(n, sizeof *pd);
     vkEnumeratePhysicalDevices(g_vk.inst, &n, pd);
     int want = ENV("LARECOMP_GPU") ? atoi(ENV("LARECOMP_GPU")) : -1, best = -1, best_score = -1;
+    uint32_t best_api = 0, best_drv = 0;
+    bool twin = false;  // (two equally ranked GPUs - the same one through two drivers: see below)
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(pd[i], &p);
@@ -271,9 +273,16 @@ static void pick_device(void) {
         if (p.apiVersion >= VK_API_VERSION_1_3) score++;
         if (g_settings.gpu_name[0] && !strcmp(p.deviceName, g_settings.gpu_name)) score = 50;
         if ((int)i == want) score = 100;
-        if (score > best_score) { best_score = score; best = (int)i; }
+        // The same GPU twice, through two drivers (#288: a laptop's RX 5600M listed by its maker's old AMD driver, Vulkan
+        // 1.3.212, and by AMD's current one, 1.4.315): the first listed was taken - the old one, whose shader compiler
+        // crashed on every pipeline, so nothing was drawn. Equal scores go to the newer Vulkan, then the newer driver.
+        bool newer = score == best_score && (p.apiVersion > best_api || (p.apiVersion == best_api && p.driverVersion > best_drv));
+        if (score == best_score && best >= 0) twin = true;
+        if (score > best_score || newer) { best_score = score; best = (int)i; best_api = p.apiVersion; best_drv = p.driverVersion; }
     }
     if (best < 0) FATAL("no Vulkan 1.2 device: the GPU driver is too old, or the GPU has no Vulkan 1.2 driver\n");
+    if (twin) LOG("[vk] gpu %d chosen: of the equally ranked ones, the newest Vulkan / driver (api %u.%u.%u)\n", best,
+                  VK_API_VERSION_MAJOR(best_api), VK_API_VERSION_MINOR(best_api), VK_API_VERSION_PATCH(best_api));
     g_vk.phys = pd[best];
     free(pd);
     vkGetPhysicalDeviceProperties(g_vk.phys, &g_vk.props);
@@ -579,13 +588,26 @@ static _Atomic int nbad_sh;
 static pthread_mutex_t bad_sh_lock = PTHREAD_MUTEX_INITIALIZER;
 static void bad_shaders_load(void) {
     FILE *f = fopen(BAD_SHADERS_FILE, "r");
-    if (!f) return;
     unsigned drv;
     unsigned long long v, s;
     int n = 0;
-    while (n < BAD_SHADERS_MAX && fscanf(f, "%u %llx %llx", &drv, &v, &s) == 3)
+    while (f && n < BAD_SHADERS_MAX && fscanf(f, "%u %llx %llx", &drv, &v, &s) == 3)
         if (drv == g_vk.props.driverVersion) bad_sh[n].vs = v, bad_sh[n++].fs = s;
-    fclose(f);
+    if (f) fclose(f);
+    // Known to every driver so far on NVIDIA's RTX 50 cards (Blackwell, device ids from 0x2b00): Houndoom's Snarl
+    // particle - the compiler crashed on it (#93, RTX 5060 Ti, Windows), the GPU ran an invalid instruction (#180, RTX
+    // 5060 Ti) or never finished the submission (#284, RTX 5080, Linux 620.70.06: skipped by hand, Snarl played without a
+    // hang twice and looked the same as on a Steam Deck). Ada and older, AMD and Intel build and run it fine. Skipped on
+    // those cards from the start, whatever the driver; LARECOMP_VK_SNARL_SKIP=0 builds it, =1 skips it on any GPU.
+    const char *e = getenv("LARECOMP_VK_SNARL_SKIP");
+    bool rtx50 = g_vk.props.vendorID == 0x10de && g_vk.props.deviceID >= 0x2b00;
+    if ((e && *e ? atoi(e) != 0 : rtx50) && n < BAD_SHADERS_MAX) {
+        bool have = false;
+        for (int i = 0; i < n; i++) have |= bad_sh[i].vs == 0x3ed672471eddbfd1ull && bad_sh[i].fs == 0xf830589dced6fa18ull;
+        if (!have) bad_sh[n].vs = 0x3ed672471eddbfd1ull, bad_sh[n++].fs = 0xf830589dced6fa18ull;
+        LOG("[vk] Snarl's particle pipeline skipped (vs 3ed672471eddbfd1 fs f830589dced6fa18: RTX 50 drivers hang or "
+            "crash on it, #284; LARECOMP_VK_SNARL_SKIP=0 builds it)\n");
+    }
     nbad_sh = n;
     if (n) LOG("[vk] %d pipeline(s) skipped: this driver's compiler crashes on them, or gave the GPU bad code near them (%s)\n", n,
                BAD_SHADERS_FILE);
@@ -653,12 +675,17 @@ bool vk_compile_crash_recover(uint64_t pc, const char *what, uint64_t fa) {
     extern const char *plat_symbol(uint64_t pc, uint64_t *offset);
     uint64_t off = 0;
     const char *m = plat_symbol(pc, &off);
-    LOG("[vk] %s accessing %#llx at %s+%llx, on a build worker: the game goes on\n", what, (unsigned long long)fa, m ? m : "?",
-        (unsigned long long)off);
     int was = rt_gpu_bad_code;
     vk_compile_crash_note();
+    if (!vk_compile_abandon()) {  // (not a build thread: the crash report follows, the pipeline listed for the next start)
+        LOG("[vk] %s accessing %#llx at %s+%llx, not on a build thread: the game can't go on\n", what,
+            (unsigned long long)fa, m ? m : "?", (unsigned long long)off);
+        return false;
+    }
     rt_gpu_bad_code = was;  // (no dialog comes: a later, unrelated crash mustn't read as this one)
-    return vk_compile_abandon();
+    LOG("[vk] %s accessing %#llx at %s+%llx, on a build thread: the game goes on\n", what, (unsigned long long)fa,
+        m ? m : "?", (unsigned long long)off);
+    return true;
 }
 
 void vk_device_fault_report(void) {
@@ -1153,10 +1180,23 @@ static void create_device(void) {
     // vkCreateDevice -4 on Dozen two minutes after a device loss on AMD's Vulkan driver - D3D12 refused the new device,
     // likely Windows still recovering the GPU or blocking this program after the reset). The settings file already says
     // Vulkan (the Graphics API choice is only kept once the device and swapchain are up), so this can't loop.
-    if (created != VK_SUCCESS && g_vk.dozen && !ENV("LARECOMP_DX12_NO_FALLBACK")) {
-        LOG("[vk] DirectX 12 (Dozen) could not create its device (%d: %s): starting again on Vulkan\n", created,
-            created == VK_ERROR_DEVICE_LOST ? "Direct3D 12 reports the GPU removed or reset" : "Direct3D 12 refused");
-        launcher_log_file("[vk] DirectX 12 could not create its device (%d): started again on Vulkan\n", created);
+    // DirectX 12 on an NVIDIA GPU (the setting, not LARECOMP_DX12=1): the same. It is there for AMD cards whose Vulkan
+    // driver crashes the game; on NVIDIA, Vulkan is the right path, and Dozen there crashed in its own layer at the
+    // first frames (#172, RTX 4050 Laptop, v0.1.17) and, on v0.1.18, froze on the start screen (a fence waited 2 s and
+    // more, nothing drawn) - no crash, so e380c58's switch never came.
+    bool dzn_nvidia = created == VK_SUCCESS && g_vk.dozen && !ENV("LARECOMP_DX12") &&
+                      (g_vk.props.vendorID == 0x10de || strstr(g_vk.props.deviceName, "NVIDIA"));
+    if ((created != VK_SUCCESS || dzn_nvidia) && g_vk.dozen && !ENV("LARECOMP_DX12_NO_FALLBACK")) {
+        if (dzn_nvidia) {
+            LOG("[vk] DirectX 12 (Dozen) on an NVIDIA GPU (%s): starting again on Vulkan, this GPU's own driver "
+                "(LARECOMP_DX12=1 keeps DirectX 12)\n", g_vk.props.deviceName);
+            launcher_log_file("[vk] DirectX 12 on an NVIDIA GPU: started again on Vulkan\n");
+            vkDestroyDevice(g_vk.dev, NULL), g_vk.dev = VK_NULL_HANDLE;
+        } else {
+            LOG("[vk] DirectX 12 (Dozen) could not create its device (%d: %s): starting again on Vulkan\n", created,
+                created == VK_ERROR_DEVICE_LOST ? "Direct3D 12 reports the GPU removed or reset" : "Direct3D 12 refused");
+            launcher_log_file("[vk] DirectX 12 could not create its device (%d): started again on Vulkan\n", created);
+        }
         g_settings.dx12 = false;
         settings_save();
         _putenv_s("VK_DRIVER_FILES", "");
@@ -1217,6 +1257,17 @@ static void create_device(void) {
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.dev, .instance = g_vk.inst,
                                  .pVulkanFunctions = &vf, .vulkanApiVersion = g_vkc.api,
                                  .flags = budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0};
+    // (test: LARECOMP_TEST_HEAP_LIMIT_MB=<n> - every device-local heap seen as that small, like an integrated GPU's
+    // carve-out: textures.c's budget fallback, #281)
+    VkDeviceSize heap_limit[VK_MAX_MEMORY_HEAPS];
+    if (getenv("LARECOMP_TEST_HEAP_LIMIT_MB")) {
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+        for (uint32_t h = 0; h < VK_MAX_MEMORY_HEAPS; h++)
+            heap_limit[h] = h < mp.memoryHeapCount && (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                                ? (VkDeviceSize)atoll(getenv("LARECOMP_TEST_HEAP_LIMIT_MB")) << 20 : VK_WHOLE_SIZE;
+        ai.pHeapSizeLimit = heap_limit;
+    }
     VK_CHECK(vmaCreateAllocator(&ai, &g_vk.vma));
     vk_log_memory("start");
 
@@ -1775,14 +1826,19 @@ static int screen_watch(void *arg) {
     bool test = ENV("LARECOMP_TEST_SCREEN_STALE") != NULL, have = false;
     bool fired = false, moved = false;  // (a recovery asked for; the grab changed since)
     uint32_t last_scr = 0, last_img = 0;
-    int stale = 0;
+    int stale = 0, since = 0;  // (since: grabs since the recovery)
     for (;;) {
         SDL_Delay(1000);
         void *hwnd = SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
         uint32_t scr = 0, img = atomic_load(&g_img_changes);
         // (in the background or minimised: can't tell - and the window shown anew after it, a recovery counts again)
         if (!test && !plat_window_screen_hash(hwnd, &scr)) { have = fired = false, stale = 0; continue; }
-        if (have && scr != last_scr) moved = true;
+        // The grab changing counts once two grabs have passed since the recovery: the new swapchain's own black frame
+        // and the redraw after it are a change the grab sees even where it is blind to the game's frames (fullscreen,
+        // frames flipped to the display) - taken for "it worked", a blink every few seconds on and on (seen 4 times
+        // in 2 minutes at 50 fps, fullscreen; each focus change let it start again).
+        since++;
+        if (have && scr != last_scr && (!fired || since > 2)) moved = true;
         // (the game's image moving meanwhile)
         stale = have && scr == last_scr && (img - last_img >= 5 || test) ? stale + 1 : 0;
         have = true, last_scr = scr, last_img = img;
@@ -1793,7 +1849,7 @@ static int screen_watch(void *arg) {
             return 0;
         }
         atomic_store(&g_screen_stale, true);
-        stale = 0, fired = true, moved = false;
+        stale = 0, fired = true, moved = false, since = 0;
     }
     return 0;
 }
@@ -2278,7 +2334,7 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
         extern void widescreen_frame_end(uint64_t frame);
         widescreen_frame_end(frame);
         extern void widescreen_set_factor(float f);
-        extern bool widescreen_allowed(void);
+        extern bool widescreen_allowed_for(double w, double h);
         // render scale + placement in the window: runtime/nvn/output_scale.c (Video tab "Internal resolution");
         // GPU time since the last frame (exec.c's GPU timer; -1 without one: dynamic resolution goes by frame times):
         // the game's submissions and the window image's (LARECOMP_DYNRES_COUNT_PRESENT=0: the game's only, as before)
@@ -2306,7 +2362,7 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
             sp_have = true;
         }
         OutScale os;
-        output_scale(dw, dh, widescreen_allowed(), SDL_GetTicksNS() / 1e9, game_ms, win_ms, &os);
+        output_scale(dw, dh, widescreen_allowed_for(dw, dh), SDL_GetTicksNS() / 1e9, game_ms, win_ms, &os);
         {   // F1 > FSR 2 render resolution: the scene drawn smaller, FSR 2 upscaling it (exec.c vk_taa_render_share)
             extern float vk_taa_render_share(void);
             extern void renderer_set_present_full(bool on);
@@ -2377,6 +2433,8 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
             if (at == (long)frame) { g_gpuprof_frame = true; break; }
             if (*p == ',') p++; else break;
         }
+        extern bool vk_gpuprof_take_request(void);  // (exec.c: a slow frame the GPU held up asked for one)
+        if (!g_gpuprof_frame && vk_gpuprof_take_request()) g_gpuprof_frame = true;
     }
     if (g_debug_frame) LOG("===== debug frame %llu =====\n", (unsigned long long)frame);
     {   // LARECOMP_SHOT_AT=<frame>,<frame>,... (ascending): the game image at those frames -> build/frames/frame_N.png
@@ -2458,6 +2516,8 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
     }
 }
 
+static _Atomic long debug_frames_at, debug_frames_n;  // (present_hooks: the frames to dump; debug_frame_after_present)
+void debug_frame_after_present(uint64_t frame);
 // The game thread's side of a present: the frame counters and the per-frame hooks (input, pacing, test hooks).
 static void present_hooks(void) {
     total_frames++;
@@ -2492,7 +2552,16 @@ static void present_hooks(void) {
     // LARECOMP_DEBUG_FRAMES=<n> (with LARECOMP_DEBUG_FRAME / F9): dump n consecutive frames (build/pass_<frame>_NNN.png)
     static long debug_n = -1;
     if (debug_n < 0) { const char *e = ENV("LARECOMP_DEBUG_FRAMES"); debug_n = e && atol(e) > 1 ? atol(e) : 1; }
-    g_debug_frame = debug_at && total_frames >= (uint64_t)debug_at && total_frames < (uint64_t)debug_at + (uint64_t)debug_n;
+    atomic_store(&debug_frames_at, debug_at), atomic_store(&debug_frames_n, debug_n);
+    if (!rq_on()) debug_frame_after_present(total_frames - 1);
+}
+
+// The frames dumped (F9 / LARECOMP_DEBUG_FRAME) are decided where their lists are translated: with the render thread
+// that is after it ran the present before them (rqueue.c) - set here, on the game thread, the flag was over by the
+// time the render thread got to the frame, and F9 caught only its first few passes.
+void debug_frame_after_present(uint64_t frame) {
+    long at = atomic_load(&debug_frames_at), n = atomic_load(&debug_frames_n);
+    g_debug_frame = at && frame + 1 >= (uint64_t)at && frame + 1 < (uint64_t)at + (uint64_t)n;
 }
 
 void backend_present(NvnTexture *t) {
@@ -2630,6 +2699,11 @@ void ui_window_init(void) {
     window = SDL_CreateWindow("ZA Recomp", win_w, win_h, wflags);
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
     rt_window_icon(window);
+    if (ENV("LARECOMP_WINDOW_POS")) {  // (two games side by side: local play tests)
+        int x = 0, y = 0;
+        sscanf(ENV("LARECOMP_WINDOW_POS"), "%d,%d", &x, &y);
+        SDL_SetWindowPosition(window, x, y);
+    }
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows
     if (g_settings.fullscreen && !ENV("LARECOMP_WINDOW") && !ENV("LARECOMP_HIDDEN")) SDL_SetWindowFullscreen(window, true);
     create_instance();
@@ -2674,6 +2748,18 @@ void backend_clear_window(void) {
     rq_drain();
     static const float black[4] = {0, 0, 0, 1};
     if (g_vk.dev && vk_frame_begin(black)) vk_frame_end(NULL);
+}
+// A black frame with the overlay's notice line (menu_notice) on it, before the game shows any frame of its own: the
+// shader preparation at the game's GPU setup (shader_prep.c boot_progress) - minutes on a slow driver after an update,
+// a black window the players took for a hang and closed (#291 #297). On the game thread, which is in the preparation:
+// nothing else presents. LARECOMP_PREP_SHOT=<n>: the n-th such frame into build/prep.png (tests).
+void backend_notice_frame(void) {
+    static const float black[4] = {0, 0, 0, 1};
+    static long n, shot = -1;
+    if (shot < 0) shot = getenv("LARECOMP_PREP_SHOT") ? atol(getenv("LARECOMP_PREP_SHOT")) : 0;
+    if (!g_vk.dev || rq_stopping() || !vk_frame_begin(black)) return;
+    menu_render((void *)vk_cmd(), g_vk.sc_extent.width, g_vk.sc_extent.height);
+    vk_frame_end(shot && ++n == shot ? "build/prep.png" : NULL);
 }
 
 // [window]: what happens to the window (focus, minimised, covered, display) - #15: a window that stops responding
@@ -2720,7 +2806,9 @@ int ui_run(void) {
                 const char *test_stall = getenv("LARECOMP_TEST_QUIT_STALL_MS");
                 if (test_stall) SDL_Delay((Uint32)strtoul(test_stall, NULL, 10));
 #endif
-                backend_quit();
+                backend_quit();  // (before exit(): see there)
+                extern void bugrec_finish(void);
+                bugrec_finish();  // (a bug recording: packed - runtime/bugrec.c)
 #ifdef _WIN32
                 if (validating) validation_exit();
                 fflush(stdout); fflush(stderr);

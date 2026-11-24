@@ -2,7 +2,7 @@
 #include <assert.h>
 #include <stdio.h>
 
-Module g_modules[4];
+Module g_modules[6];
 int g_nmodules;
 
 int main(void) {

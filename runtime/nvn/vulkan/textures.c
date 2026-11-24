@@ -212,9 +212,22 @@ static bool tex_scalable(const NvnTexture *t) {
     static int off = -1;  // (per texture lookup: cached)
     if (off < 0) off = getenv("LARECOMP_NO_SCALE") != NULL;
     if (off) return false;
-    if (t->target != 1 || t->samples > 1 || !(t->flags & 8) || t->width < 32 || t->height < 16) return false;
+    if (t->samples > 1 || !(t->flags & 8) || t->width < 32 || t->height < 16) return false;
     float a = (float)t->width / (float)t->height;
-    return a > 1.74f && a < 1.81f;
+    if (t->target == 1 && a > 1.74f && a < 1.81f) return true;
+    // A render target of the screen's height but narrower than it, drawn with the screen's depth: Pokémon Z-A's outfit
+    // and appearance previews (Outfit & Looks, boutiques, salon) draw the player into a 1600x1080 x 6 array with the
+    // scene's 1920x1080 depth. Left at the game's size next to a scaled depth, the pass's area was the smaller of the
+    // two - the depth's scaled size - so only the preview's top-left 960x540 (render scale 0.5) or 1280x720 (0.667)
+    // was drawn and the rest showed old contents (issues #318, #344). Scaled like the depth, both have one size again.
+    if ((t->target == 1 || t->target == 4) && (t->height == 1080 || t->height == 720) && t->width >= t->height &&
+        a <= 1.74f) {
+        static int nlog;
+        if (nlog++ < 4) LOG("[vk] render target %ux%u (%u layers) scaled with the screen (its height)\n", t->width, t->height,
+                            t->target == 4 ? t->depth : 1);
+        return true;
+    }
+    return false;
 }
 
 // Shadow maps (square depth render targets, also arrays: Pokemon Z-A's cascades are 1024x1024 x 3) keep the game's size
@@ -445,8 +458,31 @@ static void create_image(NvnTexture *t, TexBackend *b) {
                             .extent = {tw, th, depth}, .mipLevels = levels, .arrayLayers = layers,
                             .samples = (VkSampleCountFlagBits)samples, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
-    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    // An integrated GPU whose "video memory" is a small carve-out of the RAM (#281: Ryzen 7 5700U, heap 0 = 256 MB,
+    // budget 243 MB) got the game's ~4000 textures there anyway: 629 MB in it, 2.5x its budget, and after ~5 min a
+    // 6.4 s frame, corrupted draws and device lost. Such a GPU reads system memory the same way (it is all RAM), so
+    // there the textures stay within the heap's budget and the rest goes to system memory (VMA picks the next memory
+    // type). Only when the largest device-local heap is under 1 GB; LARECOMP_VK_TEX_BUDGET=0 off, =1 on any GPU.
+    static int within = -1;
+    if (within < 0) {
+        const char *e = getenv("LARECOMP_VK_TEX_BUDGET");
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+        VkDeviceSize big = 0;
+        for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
+            if ((mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[h].size > big) big = mp.memoryHeaps[h].size;
+        within = e ? atoi(e) != 0
+                   : g_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && big < (1ull << 30);
+        if (within) LOG("[vk] textures kept within the video memory budget (largest device-local heap %llu MB): the rest in system memory\n",
+                        (unsigned long long)(big >> 20));
+    }
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+                                  .flags = within ? VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT : 0};
     VkResult r = vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL);
+    if (r != VK_SUCCESS && ai.flags) {  // (over every heap's budget: as before, wherever it fits)
+        ai.flags = 0;
+        r = vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL);
+    }
     if (r != VK_SUCCESS) {
         // (the Vulkan side too: a driver can refuse a format / usage / tiling combination with "out of device memory",
         // issue #45 - a GTX 1060 failing a 1920x1080 image with plenty of memory free)
@@ -607,8 +643,10 @@ void backend_texture_destroyed(NvnTexture *t) {
 
 // Reboot (device.c backend_reset; GPU idle): every game texture and its views go. A backend whose texture no longer
 // exists (or names another backend) is released on its own, its texture not touched.
+static void hd_prompts_reset(void);
 void vk_textures_reset(void) {
     int n = g_nlive, stale = 0;
+    hd_prompts_reset();
     extern void vk_alias_reset(void);
     extern bool nvn_texture_exists(NvnTexture *t);
     vk_alias_reset();
@@ -623,7 +661,6 @@ void vk_textures_reset(void) {
         free(b);
     }
     vk_collect_dead();
-    hd_reset_prompt();
     LOG("[vk] reboot: %d textures released%s\n", n, stale ? " (some without their texture: see below)" : "");
     if (stale) LOG("[vk] reboot: %d of them belonged to textures already gone (#70)\n", stale);
 }
@@ -647,13 +684,11 @@ static int hd_on = -1, hd_dump = -1;
 // silently ignored (#139: "turning it on nothing changes")
 typedef struct { uint64_t *h; uint16_t *f; int n; char dir[48]; char (*fold)[400]; int nfold; } HdSet;
 static HdSet hd_sets[2];  // [0] button prompts, [1] HD pack
-static bool prompt_set_initialized;
 static int prompt_live_style = -1;
 static bool title_prompt_texture(const NvnTexture *t){
     extern uint8_t g_main_build_id[8];
     return za_title_prompt_shape(g_main_build_id,t->width,t->height,t->format,t->target,t->samples);
 }
-static void hd_reset_prompt(void) { prompt_set_initialized = false; prompt_live_style = -1; }
 static int hd_cmp(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
 typedef struct { uint64_t h; uint16_t f; } HdEnt;
 static int hd_ent_cmp(const void *a, const void *b) {
@@ -713,22 +748,25 @@ static const char *hd_folder(const HdSet *s, uint64_t h) {
     return p ? s->fold[s->f[p - s->h]] : s->dir;
 }
 
+static bool hd_prompts_ready;  // (hd_sets[0] scanned for this boot's set; vk_textures_reset clears it)
 static void hd_init(void) {
-    if (hd_on >= 0 && prompt_set_initialized) return;
-    if (hd_on < 0) {
-        const char *e = ENV("LARECOMP_TEX_HD");
-        hd_on = e ? atoi(e) != 0 : g_settings.tex_hd;
-        e = ENV("LARECOMP_TEX_DUMP");
-        hd_dump = e ? atoi(e) != 0 : g_settings.tex_dump;
-        if (hd_dump) { SDL_CreateDirectory("textures"); SDL_CreateDirectory("textures/dump"); }
-        if (hd_on) hd_scan(&hd_sets[1], "textures/hd");
+    if (!hd_prompts_ready) {
+        // The set is the one this boot chose: going back to the start screen (F1) and picking another reboots the
+        // game in this process - the previous set's textures stayed (the PlayStation icons after choosing Xbox)
+        hd_prompts_ready = true;
+        extern const char *pl_prompt_set(void);
+        const char *set = pl_prompt_set();
+        char dir[48];
+        snprintf(dir, sizeof dir, "textures/prompts/%s", set ? set : "");
+        if (set) hd_scan(&hd_sets[0], dir);
     }
-    extern const char *pl_prompt_set(void);
-    const char *set = pl_prompt_set();
-    char dir[48];
-    snprintf(dir, sizeof dir, "textures/prompts/%s", set ? set : "");
-    hd_scan(&hd_sets[0], set ? dir : "");
-    prompt_set_initialized = true;
+    if (hd_on >= 0) return;
+    const char *e = ENV("LARECOMP_TEX_HD");
+    hd_on = e ? atoi(e) != 0 : g_settings.tex_hd;
+    e = ENV("LARECOMP_TEX_DUMP");
+    hd_dump = e ? atoi(e) != 0 : g_settings.tex_dump;
+    if (hd_dump) { SDL_CreateDirectory("textures"); SDL_CreateDirectory("textures/dump"); }
+    if (hd_on) hd_scan(&hd_sets[1], "textures/hd");
 }
 
 static const HdSet *hd_find(uint64_t h) {
@@ -737,6 +775,15 @@ static const HdSet *hd_find(uint64_t h) {
     return NULL;
 }
 static bool hd_has(uint64_t h) { return hd_find(h) != NULL; }
+// Reboot: the button prompt set is chosen again (runtime/hle/pl.c pl_reset) and scanned again at first use
+static void hd_prompts_reset(void) {
+    HdSet *s = &hd_sets[0];
+    free(s->h), free(s->f), free(s->fold);
+    memset(s, 0, sizeof *s);
+    hd_prompts_ready = false;
+    prompt_live_style = -1;
+}
+static bool hd_prompt_listed(uint64_t h) { return hd_sets[0].n && bsearch(&h, hd_sets[0].h, hd_sets[0].n, sizeof h, hd_cmp); }
 
 // plain 2D colour textures the game fills from the CPU (not render targets, video frames or linear / changing ones)
 static bool hd_candidate(const NvnTexture *t, const TexBackend *b) {
@@ -1018,7 +1065,7 @@ static void hd_pending_process(void) {
     for (int i = 0; i < hd_wait_n; i++) {
         HdWait w = hd_wait[i];
         TexBackend *b = w.t ? w.t->backend : NULL;
-        if (!b || hd_on <= 0 || b->hd || b->data_hash != w.h || !b->image || !hd_candidate(w.t, b)) { hds_dropped++; continue; }
+        if (!b || hd_on <= 0 || b->hd || b->name_hash != w.h || !b->image || !hd_candidate(w.t, b)) { hds_dropped++; continue; }
         pthread_mutex_lock(&hdc_lock);
         HdCacheEnt *e = hdc_get(w.h, false);
         int st = e ? e->state : HDC_FAILED;
@@ -1133,7 +1180,7 @@ static void hd_switch(void) {
     for (int i = 0; i < g_nlive; i++) {
         TexBackend *b = g_live[i];
         NvnTexture *t = b->owner;
-        if (was && !hd_on && b->hd && !(hd_sets[0].n && bsearch(&b->data_hash, hd_sets[0].h, hd_sets[0].n, sizeof b->data_hash, hd_cmp))) {
+        if (was && !hd_on && b->hd && !(hd_sets[0].n && bsearch(&b->name_hash, hd_sets[0].h, hd_sets[0].n, sizeof b->name_hash, hd_cmp))) {
             destroy_image(b);
             b->hd = false;
             create_image(t, b);
@@ -1250,7 +1297,7 @@ void vk_texdump_process(void) {  // (device.c backend_present_now, each frame)
     for (int i = 0; i < hd_qn; i++) {
         HdDump d = hd_q[i];
         TexBackend *b = d.t ? d.t->backend : NULL;
-        if (!b || b->hd || b->data_hash != d.h) continue;  // (gone or changed)
+        if (!b || b->hd || b->name_hash != d.h) continue;  // (gone or changed)
         if (done >= 24) { hd_q[k++] = d; continue; }  // (a few per frame: each one waits for the GPU)
         char path[64];
         snprintf(path, sizeof path, "textures/dump/%016llx.png", (unsigned long long)d.h);
@@ -1267,21 +1314,7 @@ static uint64_t full_hash_budget, full_hash_budget_frame;
 
 // Four independent lanes (one serial multiply chain ran at ~1.5 bytes/cycle; dynamic textures are hashed every
 // frame). Values are only compared within a run.
-static uint64_t hash_full(const uint8_t *p, uint64_t n) {
-    uint64_t h0 = 0x9E3779B97F4A7C15ull ^ n, h1 = 0xC2B2AE3D27D4EB4Full, h2 = 0x165667B19E3779F9ull, h3 = 0x27D4EB2F165667C5ull;
-    uint64_t i = 0;
-    for (; i + 32 <= n; i += 32) {
-        uint64_t v[4];
-        memcpy(v, p + i, 32);
-        h0 = (h0 ^ v[0]) * 0x100000001B3ull; h0 ^= h0 >> 29;
-        h1 = (h1 ^ v[1]) * 0x100000001B3ull; h1 ^= h1 >> 29;
-        h2 = (h2 ^ v[2]) * 0x100000001B3ull; h2 ^= h2 >> 29;
-        h3 = (h3 ^ v[3]) * 0x100000001B3ull; h3 ^= h3 >> 29;
-    }
-    uint64_t h = h0 ^ (h1 * 0x9E3779B97F4A7C15ull) ^ (h2 * 0xC2B2AE3D27D4EB4Full) ^ (h3 * 0x165667B19E3779F9ull);
-    for (; i < n; i++) h = (h ^ p[i]) * 0x100000001B3ull;
-    return h ^ (h >> 31);
-}
+static uint64_t hash_full(const uint8_t *p, uint64_t n) { return tex_hash_prompt(p, n); }  // (tex_hash.h)
 
 static uint64_t fnv_sample(const uint8_t *p, uint64_t n) {
     uint64_t h = 1469598103934665603ull;
@@ -1484,8 +1517,13 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     b->data_hash = h;
     b->uploaded = true;
     hd_init();
-    bool title_keyboard=prompt_live_style==105&&title_prompt_texture(t);
-    if (b->hd && (b->dynamic || !(title_keyboard||hd_has(h) || lm_listed(h)))) {  // an HD-replaced texture the game rewrote: back to its own image
+    // The name its replacement goes by (tex_hash.h tex_pack_name: the button prompts and the HD pack are named by
+    // different hashes, #229). Only worked out when a prompt set is there and the texture could be one of its icons.
+    uint64_t name = h;
+    if (hd_sets[0].n && (b->hd || hd_candidate(t, b))) name = tex_pack_name(mem, total, h, fast, hd_prompt_listed);
+    b->name_hash = name;
+    bool title_keyboard = prompt_live_style == 105 && title_prompt_texture(t);
+    if (b->hd && (b->dynamic || !(title_keyboard || hd_has(name) || lm_listed(h)))) {  // an HD-replaced texture the game rewrote: back to its own image
         destroy_image(b);
         b->hd = false;
         create_image(t, b);
@@ -1504,8 +1542,8 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     }
     if (hd_candidate(t, b)) {
         // (a pack texture: drawn from its image now when it is in memory, else the game's below until it is read)
-        if (hd_has(h) && hd_request(t, b, h) > 0) return;
-        if (hd_dump) hd_queue_dump(t, h);
+        if (hd_has(name) && hd_request(t, b, name) > 0) return;
+        if (hd_dump) hd_queue_dump(t, name);
         if (lm_listed(h)) lm_queue(t, h);
     }
     if (b->format != mf.vf && !b->astc_bw) return;  // unsupported format: nothing sensible to copy

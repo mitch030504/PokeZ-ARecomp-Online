@@ -3,6 +3,9 @@
 #include <assert.h>
 #include <sys/time.h>
 
+Module g_modules[6];
+int g_nmodules;
+
 int main(void) {
     int server = socket(AF_INET, SOCK_DGRAM, 0);
     assert(server >= 0);

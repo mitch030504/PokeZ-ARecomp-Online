@@ -44,6 +44,7 @@ extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto"
 
 typedef struct {
     int aspect;          // ASPECT_*: unlocked = fill the window (wider/taller views), original = 16:9 with bars
+    int hud_width;       // Pokémon Z-A wider than 16:9: % of the extra width the HUD's sides move out by (0: the 16:9 box)
     bool fullscreen;
     int res_mode;        // RES_MATCH, 1..4 (N x the Switch's 1080p), RES_DYNAMIC, RES_Q75/50/25 (share of the display)
     bool res_auto;       // never chosen: the default for this GPU (settings_resolve_defaults); saved as "auto"
@@ -66,6 +67,7 @@ typedef struct {
     bool reverb;         // room reverb effect
     bool movie_audio;
     bool show_fps;
+    bool mystery_gift;   // Pokémon Z-A: Mystery Gift from mystery_gift/ (bcat.c; nifm reports a connection: misc.c)
     bool fps60;  // Pokémon Z-A: its frame clock at 1/60 s per frame (runtime/hle/framepace.c)
     bool aniso16;  // Texture filtering High: 16x anisotropic and trilinear on every mipmapped sampler (runtime/nvn/vulkan/textures.c)
     bool hdr;            // HDR output when Windows has the display in HDR mode (vulkan/device.c, exec.c vk_hdr_encode)
@@ -98,6 +100,9 @@ typedef struct {
     int mouse_camera;    // MOUSE_CAM_*: how the mouse turns the camera (runtime/hle/input.c)
     float mouse_sens;    // mouse camera speed, 1 = default
     int rstick_snap;     // degrees: a right stick this close to an axis is put on it (0 = off): runtime/hle/input.c
+    int lstick_deadzone; // percent of the left stick's travel read as rest (0 = off, the stick goes raw): runtime/hle/input.c
+    int rstick_deadzone; // percent of the right stick's travel read as rest (0 = off, the default): camera drift, #275
+    int lstick_outer;    // percent of its travel from which the left stick reads as full (a pad's diagonals stop short)
     bool blur_removal;   // no tilt-shift blur at the top / bottom of the screen
     bool hide_hero_icon; // no Hero Mode icon on the HUD
     bool mirror_mode;    // the world mirrored left to right (Gameplay tab): renderers + runtime/hle/input.c
@@ -147,12 +152,25 @@ typedef struct {
     bool smooth_anim; // Pokémon Z-A 2.0.2: distant characters animate every frame (runtime/hle/framepace.c
                       // rt_za_smooth_anim). On by default; LARECOMP_SMOOTH_ANIM=0 / 1 overrides it at load.
     int camera_distance; // Pokémon Z-A 2.0.2: follow-camera distance as a percentage, 50-200; 100 is the game's own.
+    bool full_detail; // Pokémon Z-A: every model at its full detail at any distance (cache/maxlod, made from the
+                      // player's game files by zaprompts --maxlod: runtime/ui/launcher.mm launcher_maxlod_kick;
+                      // layered by runtime/services/fs.c). Off by default (GPU time); from the next start. #190
+    int draw_dist;    // Pokémon Z-A: the world's LOD / culling distances in percent (100: the game's; 150, 200, 300):
+                      // cache/drawdist, made from the player's files by zaprompts --drawdist (runtime/ui/launcher.mm
+                      // launcher_drawdist_kick), layered by runtime/services/fs.c. From the next start. #190
+    bool content_stones;  // Pokémon Z-A, F1 > Content: the Ranked Battle Mega Stones in the Mega Shard exchange, and
+    bool content_trade;   // trade evolutions without a trade (cache/content, made from the player's files by zaprompts
+                          // --content: runtime/ui/launcher.mm launcher_content_kick; layered by runtime/services/fs.c).
+                          // Off by default; from the next start
     int ui_lang;      // UI_LANG_*: the start screen's language (runtime/ui/launcher.mm); auto = the system's
     // mods/ folders (runtime/services/fs.c layers them): '|' between names. order: first wins where two replace the
     // same file (folders not listed come after, by name); off: not loaded. Edited on the start screen's Mods page.
     char mods_order[1024];
     char mods_off[1024];
     bool mouse_aim_camera; // keep the mouse view fixed as ball aiming begins
+    // the mods whose code runs (exefs: subsdk programs, .pchtxt patches - runtime/codemods.c, runtime/gamebuild.c):
+    // off unless listed, each turned on after a warning on the Mods page (LARECOMP_CODE_MODS=1: all of them)
+    char mods_code_on[1024];
 } Settings;
 
 
@@ -166,11 +184,13 @@ bool settings_ui_portuguese(void);
 #define UI_TR(en, pt) (settings_ui_portuguese() ? (pt) : (en))
 // name is one of list's '|'-separated entries
 bool settings_list_has(const char *list, const char *name);
+bool settings_mod_code_on(const char *name);  // mods/<name>'s code runs (Mods page; LARECOMP_CODE_MODS=1: all)
 
 extern Settings g_settings;
 
 void settings_load(void);
 void settings_save(void);
+extern bool g_settings_fresh;  // no settings file at load: a first start (runtime/hle/bindings.c bind_pad_first_start)
 // At device init: the defaults that depend on the GPU. integrated (Vulkan: an integrated GPU; never on macOS): plain
 // bilinear upscaling instead of the sharp upscaler, whose pass at the window's size costs as much as the game's frame
 // there (UHD 770: FSR 1 + SMAA 8 ms of GPU per frame at 1080p, 20 ms at 4K), and Dynamic resolution instead of Match

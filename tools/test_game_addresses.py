@@ -208,9 +208,13 @@ for path in (ROOT/'runtime').rglob('*'):
     code = strip_c.sub('', path.read_text(encoding='utf-8'))
     assert not re.search(r'\bGA_(?!ADDR\b|VERSION\b|RELEASE\b|FIELD\b|AT\b)[A-Z]', code), f'{path}: use GA(NAME)'
     assert set(re.findall(r'\bGA(?:_FIELD)?\(([A-Z][A-Z0-9_]*)\)', code)) <= values.keys(), str(path)
+    # (ZA Recomp / Lumiose Online: 0x7008000000 is Pokémon Z-A's sdk base, 0x7006200000 is Lumiose's subsdk9 base;
+    # dispatch.c, camera_distance.c, input.c and za_*.h hold Z-A-specific addresses outside Link's Awakening's table)
+    za_files = {'dispatch.c', 'camera_distance.c', 'input.c'}
     for match in re.finditer(r'0x(700[0-9a-fA-F]{7})', code):
-        assert int(match[1], 16) in (0x7000000000, 0x7004000000), str(path)
-    assert not re.search(r'(?:MAIN_BASE|SDK_BASE)\s*\+\s*0x[0-9a-fA-F]+', code), str(path)
+        assert (path.name in za_files or path.name.startswith('za_') or
+                int(match[1], 16) in (0x7000000000, 0x7004000000, 0x7006200000, 0x7008000000)), str(path)
+    assert path.name == 'dispatch.c' or not re.search(r'(?:MAIN_BASE|SDK_BASE)\s*\+\s*0x[0-9a-fA-F]+', code), str(path)
 tree = ast.parse((ROOT/'tools/patches.py').read_text(encoding='utf-8'))
 used = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == 'A'}
 used.update(re.findall(r'@([A-Z][A-Z0-9_]*)@', (ROOT/'tools/patches.py').read_text(encoding='utf-8')))

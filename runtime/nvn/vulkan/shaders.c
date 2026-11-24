@@ -116,8 +116,11 @@ static uint32_t *no_contraction(uint32_t *spv, size_t *nwords) {
 // No spirv-opt by default: it rewrote the depth pre-pass and colour-pass vertex shaders differently enough that
 // their depths stopped matching (EQUAL test: black holes in foliage), and it was most of the compile time; the
 // driver optimises anyway. LARECOMP_VK_OPT=1 turns it back on (experiments).
+// (exec.c's compute sweep, #315) this thread's next compiles with the SPIR-V optimizer (LARECOMP_VK_OPT for all)
+__thread int vk_spirv_opt_perf;
 uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords) {
     uint64_t h = src_hash(src, stage);
+    if (vk_spirv_opt_perf) h = (h ^ 0x9E3779B97F4A7C15ull) * 0x100000001B3ull;  // (its own cache entry)
     static int nocache = -1;
     if (nocache < 0) nocache = ENV("LARECOMP_VK_NO_SPIRV_CACHE") != NULL;
     uint32_t *out = nocache ? NULL : cache_load(h, nwords);
@@ -127,7 +130,7 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
     shaderc_compile_options_t o = shaderc_compile_options_initialize();
     shaderc_compile_options_set_target_env(o, shaderc_target_env_vulkan,  // (SPIR-V 1.6 / 1.5: compat.c)
                                            g_vkc.api >= VK_API_VERSION_1_3 ? shaderc_env_version_vulkan_1_3 : shaderc_env_version_vulkan_1_2);
-    shaderc_compile_options_set_optimization_level(o, ENV("LARECOMP_VK_OPT") ? shaderc_optimization_level_performance
+    shaderc_compile_options_set_optimization_level(o, ENV("LARECOMP_VK_OPT") || vk_spirv_opt_perf ? shaderc_optimization_level_performance
                                                                                   : shaderc_optimization_level_zero);
     shaderc_compilation_result_t r = shaderc_compile_into_spv(comp, src, strlen(src), kind_of(stage), name, "main", o);
     shaderc_compile_options_release(o);
@@ -362,6 +365,44 @@ static const char *builtin_src(const char *name, int *stage) {
                "  mv = c.w > 0.0 ? (puv - uv) / u.jit.zw : vec2(0.0);\n"
                "  uint s = texelFetch(sten, p, 0).r;\n"
                "  rx = (s & 0xF0u) == 0x30u ? u.react.x : s == 2u ? u.react.y : 0.0;\n"
+               "}\n";
+    }
+    // DLAA for the clothing screen's character (exec.c pv_resolve), before DLSS: its motion vectors as fsr2_mv's, through
+    // the character's own transform (camera x its model matrix: the camera stays, the model turns), none where nothing
+    // was drawn (alpha 0); and its alpha as a grey picture, resolved by a DLSS feature of its own.
+    if (!strcmp(name, "pv_prep.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D dep;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D col;\n"
+               "layout(set = 0, binding = 2) uniform U { mat4 inv_cur; mat4 prev; vec4 jit; } u;\n"
+               "layout(location = 0) out vec2 mv;\n"
+               "layout(location = 1) out vec4 al;\n"
+               "void main() {\n"
+               "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+               "  float a = texelFetch(col, p, 0).a;\n"
+               "  al = vec4(a, a, a, 1.0);\n"
+               "  if (a <= 0.0) { mv = vec2(0.0); return; }\n"
+               "  float d = max(texelFetch(dep, p, 0).r, 1e-7);\n"
+               "  vec2 uv = (gl_FragCoord.xy - u.jit.xy) * u.jit.zw;\n"
+               "  vec4 c = u.prev * (u.inv_cur * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0));\n"
+               "  vec2 puv = vec2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);\n"
+               "  mv = c.w > 0.0 ? (puv - uv) / u.jit.zw : vec2(0.0);\n"
+               "}\n";
+    }
+    // After DLSS: the colour (black where nothing was drawn: alpha-weighted already) and the alpha, each resolved, back
+    // into the character's image as colour / alpha - the game blends it with SRC_ALPHA, ONE_MINUS_SRC_ALPHA.
+    if (!strcmp(name, "pv_combine.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D oc;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D oa;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() {\n"
+               "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+               "  float a = clamp(texelFetch(oa, p, 0).r, 0.0, 1.0);\n"
+               "  vec3 c = max(texelFetch(oc, p, 0).rgb, vec3(0.0));\n"
+               "  o = a > 1.0 / 512.0 ? vec4(min(c / a, vec3(1.0)), a) : vec4(0.0);\n"
                "}\n";
     }
     // ---- post passes before the present (Video tab "Anti-aliasing" / "Upscaler"): exec.c vk_present_draw.
@@ -1022,13 +1063,14 @@ static const char *builtin_src(const char *name, int *stage) {
                 "  mat4 vp = inverse(mat4(pc.m0, pc.m1, pc.m2, pc.m3));\n"
                 "  vec3 P = wpos(uv, dn);\n"
                 // (window panes are drawn just like water, and being upright they'd be all mirror to the straight-up normal
-                // below: only what faces up or down gets a reflection. Each axis takes its nearer neighbour, so an edge
-                // doesn't tilt it)
+                // below: only what is level gets a reflection - within about 11 degrees, as Z-A's water is: a car's
+                // windshield, laid back 25-40 degrees, passed the old 45 and mirrored the street, #333. Each axis takes its
+                // nearer neighbour, so an edge doesn't tilt it)
                 "  vec2 px = 1.0 / pc.sz.zw, ex = vec2(px.x, 0.0), ey = vec2(0.0, px.y);\n"
                 "  vec3 Xa = P - wpos(uv - ex, depth_at(t0, uv - ex)), Xb = wpos(uv + ex, depth_at(t0, uv + ex)) - P;\n"
                 "  vec3 Ya = P - wpos(uv - ey, depth_at(t0, uv - ey)), Yb = wpos(uv + ey, depth_at(t0, uv + ey)) - P;\n"
                 "  vec3 Ng = cross(length(Xa) < length(Xb) ? Xa : Xb, length(Ya) < length(Yb) ? Ya : Yb);\n"
-                "  if (abs(Ng.y) < 0.7 * length(Ng)) discard;\n"
+                "  if (abs(Ng.y) < 0.98 * length(Ng)) discard;\n"
                 "  vec3 V = normalize(pc.cam.xyz - P);\n"
                 // (Z-A's water is level: straight up - the depth's own slope left thin lines at its triangles' seams -
                 // tilted by gentle moving ripples, prm.w the time)
@@ -1287,6 +1329,22 @@ static const char *builtin_src(const char *name, int *stage) {
                "  if (i >= pc.n) return;\n"
                "  uint v = f[pc.src + i], w = o[pc.src + i];\n"
                "  if (v != w && (pc.cpu_wins == 0u || h[pc.dst + i] == w)) h[pc.dst + i] = v;\n"
+               "}\n";
+    }
+    // (exec.c snap_merge_back) a storing dispatch's writes into a storage snapshot, back to the original - all three in
+    // the guest heap: the words the dispatch changed (copy vs its pristine image) that the CPU didn't rewrite meanwhile
+    // (the original still the image's), and the image follows them, so the next dispatch's changes are told the same way
+    if (!strcmp(name, "snap_merge.comp")) {
+        *stage = STAGE_COMPUTE;
+        return "#version 450\n"
+               "layout(local_size_x = 256) in;\n"
+               "layout(std430, set = 0, binding = 0) buffer H { uint h[]; };\n"
+               "layout(push_constant) uniform P { uint copy; uint pristine; uint dst; uint n; } pc;\n"
+               "void main() {\n"
+               "  uint i = gl_GlobalInvocationID.x;\n"
+               "  if (i >= pc.n) return;\n"
+               "  uint v = h[pc.copy + i], w = h[pc.pristine + i];\n"
+               "  if (v != w && h[pc.dst + i] == w) { h[pc.dst + i] = v; h[pc.pristine + i] = v; }\n"
                "}\n";
     }
     // (exec.c ia_refresh) GPU-filled indirect draw parameters copied out of the guest heap (g) into private records, the

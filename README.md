@@ -33,9 +33,13 @@ It is built on **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by Peiikai
 - [Controls](#controls)
 - [Saves](#saves)
 - [Mods](#mods)
+- [Multiplayer (test)](#multiplayer-test)
+- [Mystery Gift](#mystery-gift)
+- [Online-only content](#online-only-content)
 - [Troubleshooting](#troubleshooting)
 - [Building from source](#building-from-source)
 - [Developer tools](#developer-tools)
+- [Related projects](#related-projects)
 - [Credits](#credits)
 - [Legal](#legal)
 
@@ -254,6 +258,107 @@ Menus and dialogue were checked on game version 2.0.2 in an offline test. The tr
 versions 1.0 and 1.0.1: later-game content, DLC and online play have not been fully verified and may not be translated
 or may have compatibility problems. The translation is not included with the launcher.
 
+## Multiplayer (test)
+
+> **This is a test feature.** It may not connect on every network, and it may change or be removed in a later
+> version. Please report how it works for you.
+
+Pokémon Legends Z-A's **Link Play** (link trades and private battles) works between two copies of ZA Recomp, with no
+server and no account.
+
+**Same network (home LAN, or a virtual LAN like Radmin VPN / ZeroTier / Hamachi):** nothing to set up. In the game,
+**Link Play > Nearby Players** finds the other PC as it would find a nearby Switch. Then use the game's own link code
+or room passcode, as on the console.
+
+**Over the internet:**
+1. Both players open **F1 > Online** in game and copy **Your code** (A / click copies it).
+2. Send it to your friend (WhatsApp, Discord...) and paste theirs with **Paste friend's code** (it's read from the
+   clipboard). Both of you have to paste the other's code.
+3. Wait for **Status: Connected**, usually within a minute. Then use **Link Play > Nearby Players** in the game as
+   above.
+
+If it says **Didn't connect**, one of the two networks blocks direct connections (some mobile networks and
+corporate routers). A virtual LAN (Radmin VPN, ZeroTier, Hamachi) works around that, and then no codes are needed.
+
+### How it works
+
+- **Local wireless, emulated:** the Switch's local wireless and the game's network sockets are re-created on top of
+  normal UDP on your PC (ports 47810-47817 on a LAN). The game sends and receives the same data it would on a console.
+- **Connection codes:** your code holds your public internet address and port, as seen from outside (learned from
+  public STUN servers: Google, Cloudflare), plus a random **session token** made when the game starts.
+- **No server in the middle:** after both codes are pasted, the two games send packets straight to each other until
+  both routers let them through ("hole punching"). They try at fixed times of the clock, using the time from public
+  NTP servers (Cloudflare, Google, pool.ntp.org), so the PCs' own clocks don't need to be right. No ports to forward
+  and nothing changed on your router.
+- **What is sent:** only what the game itself sends during Link Play (the trade or battle data, as on the console).
+  Your save file, your game files and your keys never leave your PC.
+
+### Security
+
+- **Your code shows your IP address.** Share it only with the person you're playing with, as with any direct
+  (peer-to-peer) game. Codes change every time the game starts, and nothing listens on the internet once the game is
+  closed.
+- **Friends only:** over the internet, the game only accepts players whose code you pasted. Every packet is signed
+  (HMAC-SHA1) with a key made from both players' session tokens. Packets from anyone else, or that fail the check,
+  are dropped before the game sees them, and so are floods (over 4000 packets a second).
+- **Signed, not encrypted:** nobody else can inject or change what you send, but the trade data itself isn't hidden
+  from someone who can watch your traffic (your network or internet provider). It is the game's own trade data, so
+  nothing personal.
+- **Same network:** local play isn't signed, just like a Switch's local wireless. Anyone on your LAN or virtual LAN can
+  see your room, and the game's own link code or passcode decides who gets in.
+- **Trust who you play with:** the other player's game sends data that your game processes, as on a console. Play
+  with people you know.
+- No accounts, no data sent to us: the project has no server at all. The only outside services used are the public
+  STUN and NTP servers above, which see your address and nothing else.
+
+### Why it works this way (and why there's no ranked mode)
+
+- **Ranked battles, random matchmaking and "Faraway Players" trades need a server** that is always online: to find
+  opponents you don't know, keep rankings and check results. In the original game those run on Nintendo's servers,
+  which a PC port can't (and shouldn't) use.
+- **ZA Recomp has no servers and doesn't ask for donations or any money.** Running a public server costs money every
+  month and needs someone to keep it up and secure, so there is no ranked or matchmaking mode, and none is planned for
+  now.
+- **What you can do today:** link trades and private battles with friends, game to game, over the internet or on the
+  same network, using the steps above. Nothing in between can go offline, and nobody but your friend is involved.
+
+## Mystery Gift
+
+**Link Play > Mystery Gift > Get via Internet** works without Nintendo's servers. It lists every Pokémon Legends: Z-A
+gift [Project Pokémon's EventsGallery](https://github.com/projectpokemon/EventsGallery) has, past and present, and
+you receive them in the game as on a console (the gift, its ribbons and IDs are the game's own).
+
+- **Nothing to keep up to date:** the list is read from EventsGallery when the game starts, so a new distribution
+  shows up once it's there. The gifts are downloaded to your PC (`cache/mystery_gift/`) the first time, and still work
+  offline after that. Nothing is sent to Nintendo, and no game data is in this repository.
+- **Spewpa** (16 Vivillon patterns, one gift): one pattern is picked for you, as the real distribution did.
+- **Your own cards:** any file in `mystery_gift/bcat/normal/` (wonder cards back to back, 0x2C8 bytes each) is listed
+  too.
+- **Turn it on:** **F1 > Online > Mystery Gift** (off by default). Off, the game sees no internet connection, as
+  before, and nothing is downloaded.
+- **Needs** game version **2.0.2**. Typed codes (Get with Code/Password) aren't supported: their gifts are in the list.
+- **Multiplayer isn't affected:** Link Play with Nearby Players and F1 > Online use the emulated local wireless, not
+  this.
+
+
+## Online-only content
+
+Some of the game's content is only handed out through Nintendo's servers. **F1 > Content** makes it available in the
+game itself; both options are off by default and apply from the next start.
+
+- **Ranked Mega Stones in the shop:** Greninjite, Delphoxite, Chesnaughtite, Baxcalibrite, Sceptilite, Swampertite and
+  Blazikenite are Ranked Battle rewards on the console (and there is no ranked mode here, see
+  [above](#why-it-works-this-way-and-why-theres-no-ranked-mode)). On, Quasartico Inc.'s Mega Shard exchange sells them
+  from the day it opens, 360 Mega Shards each.
+- **Trade evolutions without trading:** Pokémon that evolve when traded also evolve at level 40, and those that evolve
+  when traded holding an item can evolve while holding it (the evolve icon appears, day or night). Inkay, which needs
+  the console held upside down, evolves at level 30 as it is. The rules are those
+  of the "No More Trade Evolutions" mod; unlike a mod's files, the tables are made from your own game version's. Link
+  trades still work as before.
+- **How:** the item, shop and evolution tables are made from your own game files into `cache/content/` (a second or
+  two, in the background; `cache/content.log`). No game data is in this repository, and your save is not touched: you
+  buy the stones and evolve the Pokémon in the game. A mod that replaces the same table wins over it.
+
 ## DirectX 12
 
 ZA Recomp normally runs on your graphics card's **Vulkan** driver. On Windows it can also run the same renderer on the
@@ -279,11 +384,17 @@ card's **DirectX 12** driver, which helps where the Vulkan driver crashes or mis
 - **AMD Radeon RX 9000 (RDNA4) with Mesa 27.0-devel**: older mesa-git builds crashed inside `libvulkan_radeon` at
   the game's first draw because RADV 27 only initialized its PS epilog shader cache when a dynamic-state extension
   feature bit was set; Vulkan 1.3 has extended dynamic state 1 in core, so no bit was set. The renderer now enables
-  the promoted `VK_EXT_extended_dynamic_state` feature on RADV 1.3 devices as well, which makes it initialize the cache.
+  the promoted `VK_EXT_extended_dynamic_state` feature on RADV 1.3 devices, which makes it initialize the cache.
   Mesa 26.2.6 (stable) and current mesa-git both work; no stable-driver downgrade is needed. See
   [docs/linux.md](docs/linux.md#amd-rdna4-and-mesa-270-devel).
 - **Low frame rate**: lower the internal resolution or turn on Dynamic resolution, and turn off the optional graphics
   features.
+- **Mystery Gift says "We aren't able to retrieve that gift right now"** or lists nothing: check
+  **F1 > Online > Mystery Gift** is on and look at the `[mystery-gift]` lines in `logs/play.log` (the gifts listed, or
+  why a download failed; curl's own messages are in `cache/mystery_gift/curl.log`). Offline, the gifts downloaded
+  before are used.
+- **Report a bug**: [open an issue](https://github.com/Hexveil404/PokeZ-ARecomp/issues) with your GPU, driver version,
+  game version and `logs/play.log`.
 
 ## Building from source
 
@@ -311,6 +422,16 @@ For anyone working on the port itself. Players don't need these, and they stay o
 
 The [developer tools guide](docs/dev-tools.md) covers setup and how to use each one. To build ZA DevTools on Windows:
 `bash tools/devtools/build.sh`.
+
+## Related projects
+
+Projects that took ZA Recomp as their starting point, by [@fabioschmidt01](https://github.com/fabioschmidt01) - thank
+you for building on this work and for crediting it (#256):
+
+- **[PokeL-ARecomp](https://github.com/fabioschmidt01/PokeL-ARecomp)**: Pokémon Legends: Arceus.
+- **[PokeV-Recomp](https://github.com/fabioschmidt01/PokeV-Recomp)**: Pokémon Violet.
+
+They are separate projects: their issues and releases are on their own pages.
 
 ## Credits
 

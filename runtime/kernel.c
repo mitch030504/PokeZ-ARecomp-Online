@@ -246,19 +246,32 @@ int kernel_data_regions(uint64_t *addr, uint64_t *size, int max) {
     int n = 0;
     pthread_mutex_lock(&g_mlock);
     for (int i = 0; i < nregions && n < max; i++)
-        if ((regions[i].perm & 2) && regions[i].type != 0xB && regions[i].type != 0xC) {
+        if ((regions[i].perm & 2) && regions[i].type != 0xB && regions[i].type != 0xC && regions[i].addr >= GUEST_LO) {  // (rtld's stand-in: kernel_init)
             addr[n] = regions[i].addr; size[n] = regions[i].size; n++;
         }
     pthread_mutex_unlock(&g_mlock);
     return n;
 }
 
-static void region_add(uint64_t addr, uint64_t size, uint32_t type, uint32_t perm) {
+static void region_insert(uint64_t addr, uint64_t size, uint32_t type, uint32_t perm) {
     if (nregions == 1024) FATAL("too many regions\n");
-    plat_commit(addr, size);  // back it before the OS writes there (Windows: file reads into the heap)
     int i = nregions++;
     while (i > 0 && regions[i - 1].addr > addr) { regions[i] = regions[i - 1]; i--; }
     regions[i] = (Region){addr, size, type, perm};
+}
+static void region_add(uint64_t addr, uint64_t size, uint32_t type, uint32_t perm) {
+    plat_commit(addr, size);  // back it before the OS writes there (Windows: file reads into the heap)
+    region_insert(addr, size, type, perm);
+}
+
+static CodeAlias code_alias[MAX_CODE_ALIAS];
+static int ncode_alias;
+int kernel_code_aliases(CodeAlias *out, int max) {
+    pthread_mutex_lock(&g_mlock);
+    int n = ncode_alias < max ? ncode_alias : max;
+    memcpy(out, code_alias, n * sizeof *out);
+    pthread_mutex_unlock(&g_mlock);
+    return n;
 }
 
 // The SDK picks a random free address, then maps there: another thread can take it in between. The console refuses the
@@ -388,8 +401,14 @@ static void query_memory(uint64_t addr, uint64_t out) {
         }
         prev_end = r->addr + r->size;
     }
-    info[0] = prev_end;
-    info[1] = (1ull << 39) - prev_end;
+    if (addr >= (1ull << 39)) {  // past the address space: Inaccessible up to 2^64, as the console answers - a walk of
+        info[0] = 1ull << 39;     // the whole map (exlaunch's FindModules) ends when the next address wraps to 0; it
+        info[1] = 0 - (1ull << 39);  // looped forever on the free range below repeated
+        info[2] = 0x10;
+    } else {
+        info[0] = prev_end;
+        info[1] = (1ull << 39) - prev_end;
+    }
     memcpy((void *)out, info, 0x28);
 }
 
@@ -1211,68 +1230,15 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         case 23: v = 1; break;  // IsApplication
         case 26: v = 1; break;  // IsSvcPermitted
         case 27: case 28: v = 0; break;  // IoRegionHint, AliasRegionExtraSize (18.0.0+: SDK 19 games ask)
-        case 65001:
-            if (g_nmodules > 2) v = 0xffff8001u;  // experimental current-process handle
-            else r = R_INVALID_ENUM;
+        case 65001: {  // Mesosphere's MesosphereCurrentProcess: a real handle of this process (code mods ask, for
+            static KObject proc = {KOBJ_PROCESS, 1, false};  // svcMapProcessMemory; exlaunch's IPC trick only if refused)
+            v = kernel_new_handle(&proc);
             break;
+        }
         default: r = R_INVALID_ENUM; LOG("[kernel] GetInfo unknown id %u/%llu\n", id0, x[3]);
         }
         x[0] = r;
         x[1] = v;
-        break;
-    }
-    case 0x74: {  // MapProcessMemory: experimental copied alias for observing module patches
-        if (g_nmodules <= 2 || x[1] != 0xffff8001u || !x[3] || lumiose_alias_count == 64) {
-            x[0] = R_INVALID_CURRENT_MEMORY;
-            break;
-        }
-        bool source_ok = x[2] >= HLE_BASE && x[2] - HLE_BASE < HLE_SIZE && x[3] <= HLE_SIZE - (x[2] - HLE_BASE);
-        for (int i = 0; i < g_nmodules; i++) {
-            Module *m = &g_modules[i];
-            if (x[2] >= m->base && x[2] - m->base < m->size && x[3] <= m->size - (x[2] - m->base))
-                source_ok = true;
-        }
-        pthread_mutex_lock(&g_mlock);
-        if (!source_ok || x[0] < GUEST_LO || x[0] >= GUEST_HI || x[3] > GUEST_HI - x[0] ||
-            region_taken(x[0], x[3], "Lumiose MapProcessMemory")) {
-            pthread_mutex_unlock(&g_mlock);
-            x[0] = R_INVALID_CURRENT_MEMORY;
-            break;
-        }
-        uint64_t dst = x[0], src = x[2], size = x[3];
-        region_add(dst, size, 0xf, 3);
-        memcpy((void *)(uintptr_t)dst, (void *)(uintptr_t)src, size);
-        lumiose_aliases[lumiose_alias_count++] = (LumioseAlias){dst, src, size};
-        pthread_mutex_unlock(&g_mlock);
-        LOG("[lumiose test] copied alias %llx -> %llx +%llx\n", (unsigned long long)src,
-            (unsigned long long)dst, (unsigned long long)size);
-        x[0] = R_OK;
-        break;
-    }
-    case 0x75: {  // UnmapProcessMemory, for an experimental alias
-        bool found = false;
-        pthread_mutex_lock(&g_mlock);
-        for (unsigned i = 0; i < lumiose_alias_count; i++) {
-            LumioseAlias *a = &lumiose_aliases[i];
-            if (a->dst == x[0] && a->src == x[2] && a->size == x[3] && x[1] == 0xffff8001u) {
-                for (uint64_t off = 0; off + 4 <= a->size; off += 4) {
-                    uint32_t *src = (uint32_t *)(uintptr_t)(a->src + off);
-                    uint32_t *dst = (uint32_t *)(uintptr_t)(a->dst + off);
-                    if (*src != *dst) {
-                        LOG("[lumiose patch] %llx size 4 value %x (unmap)\n", (unsigned long long)(a->src + off), *dst);
-                        uint32_t value = *dst;
-                        lumiose_mirror(a->src + off, &value, sizeof value);
-                    }
-                }
-                region_remove(a->dst);
-                memmove(a, a + 1, (lumiose_alias_count - i - 1) * sizeof *a);
-                lumiose_alias_count--;
-                found = true;
-                break;
-            }
-        }
-        pthread_mutex_unlock(&g_mlock);
-        x[0] = found ? R_OK : R_INVALID_CURRENT_MEMORY;
         break;
     }
     case 0x2C:  // MapPhysicalMemory(addr, size)
@@ -1313,6 +1279,98 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         x[1] = kernel_new_handle(ev);
         x[2] = kernel_new_handle(ev);
         if (ENV("LARECOMP_PROF_SVC")) LOG("[evt] guest w=%llx r=%llx lr=%llx\n", (unsigned long long)x[1], (unsigned long long)x[2], (unsigned long long)x[30]);
+        break;
+    }
+    case 0x74: {  // MapProcessMemory(dst, process, src, size): a code mod's writable view of code (kernel.h CodeAlias)
+        pthread_mutex_lock(&g_klock);  // (the handle table, as CloseHandle changes it; let go before g_mlock below)
+        KObject *o = (uint32_t)x[1] == PSEUDO_PROCESS ? NULL : handle_get((uint32_t)x[1]);
+        bool process = (uint32_t)x[1] == PSEUDO_PROCESS || (o && o->type == KOBJ_PROCESS);
+        pthread_mutex_unlock(&g_klock);
+        if (!process) { x[0] = R_INVALID_HANDLE; break; }
+        bool lumiose_caller = getenv("LUMIOSE_TEST_MODULE") != NULL && g_nmodules > 2 &&
+            (g_nmodules <= 4 || (x[30] >= g_modules[2].base && x[30] < g_modules[2].base + g_modules[2].size));
+        if (lumiose_caller) {
+            if (!x[3] || lumiose_alias_count == 64) { x[0] = R_INVALID_CURRENT_MEMORY; break; }
+            bool source_ok = x[2] >= HLE_BASE && x[2] - HLE_BASE < HLE_SIZE && x[3] <= HLE_SIZE - (x[2] - HLE_BASE);
+            for (int i = 0; i < g_nmodules; i++) {
+                Module *m = &g_modules[i];
+                if (x[2] >= m->base && x[2] - m->base < m->size && x[3] <= m->size - (x[2] - m->base))
+                    source_ok = true;
+            }
+            pthread_mutex_lock(&g_mlock);
+            if (!source_ok || x[0] < GUEST_LO || x[0] >= GUEST_HI || x[3] > GUEST_HI - x[0] ||
+                region_taken(x[0], x[3], "Lumiose MapProcessMemory")) {
+                pthread_mutex_unlock(&g_mlock);
+                x[0] = R_INVALID_CURRENT_MEMORY;
+                break;
+            }
+            uint64_t dst = x[0], src = x[2], size = x[3];
+            region_add(dst, size, 0xf, 3);
+            memcpy((void *)(uintptr_t)dst, (void *)(uintptr_t)src, size);
+            lumiose_aliases[lumiose_alias_count++] = (LumioseAlias){dst, src, size};
+            pthread_mutex_unlock(&g_mlock);
+            LOG("[lumiose test] copied alias %llx -> %llx +%llx\n", (unsigned long long)src,
+                (unsigned long long)dst, (unsigned long long)size);
+            x[0] = R_OK;
+            break;
+        }
+        pthread_mutex_lock(&g_mlock);
+        if (ncode_alias == MAX_CODE_ALIAS || region_taken(x[0], x[3], "MapProcessMemory")) {
+            pthread_mutex_unlock(&g_mlock);
+            x[0] = R_INVALID_CURRENT_MEMORY;
+            break;
+        }
+        region_add(x[0], x[3], 0xB, 3);
+        memcpy((void *)x[0], (void *)x[2], x[3]);
+        code_alias[ncode_alias++] = (CodeAlias){x[0], x[2], x[3]};
+        pthread_mutex_unlock(&g_mlock);
+        LOG("[kernel] MapProcessMemory %llx <- %llx +%llx (lr %llx)\n", x[0], x[2], x[3], x[30]);
+        x[0] = R_OK;
+        break;
+    }
+    case 0x61: case 0x6F: {  // BreakDebugProcess, GetSystemInfo: a code mod (Hakkun's debug tools) asks; refused
+        static int nlog;
+        if (nlog++ < 4) LOG("[kernel] svc 0x%x (a code mod's, lr %llx): refused\n", imm, x[30]);
+        x[0] = R_INVALID_ENUM;
+        break;
+    }
+    case 0x75: {  // UnmapProcessMemory(dst, process, src, size): what was written there taken first
+        pthread_mutex_lock(&g_klock);
+        KObject *o = (uint32_t)x[1] == PSEUDO_PROCESS ? NULL : handle_get((uint32_t)x[1]);
+        bool process = (uint32_t)x[1] == PSEUDO_PROCESS || (o && o->type == KOBJ_PROCESS);
+        pthread_mutex_unlock(&g_klock);
+        if (!process) { x[0] = R_INVALID_HANDLE; break; }
+        bool lumiose_found = false;
+        pthread_mutex_lock(&g_mlock);
+        for (unsigned i = 0; i < lumiose_alias_count; i++) {
+            LumioseAlias *a = &lumiose_aliases[i];
+            if (a->dst == x[0] && a->src == x[2] && a->size == x[3]) {
+                for (uint64_t off = 0; off + 4 <= a->size; off += 4) {
+                    uint32_t *src = (uint32_t *)(uintptr_t)(a->src + off);
+                    uint32_t *dst = (uint32_t *)(uintptr_t)(a->dst + off);
+                    if (*src != *dst) {
+                        LOG("[lumiose patch] %llx size 4 value %x (unmap)\n", (unsigned long long)(a->src + off), *dst);
+                        uint32_t value = *dst;
+                        lumiose_mirror(a->src + off, &value, sizeof value);
+                    }
+                }
+                region_remove(a->dst);
+                memmove(a, a + 1, (lumiose_alias_count - i - 1) * sizeof *a);
+                lumiose_alias_count--;
+                lumiose_found = true;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_mlock);
+        if (lumiose_found) { x[0] = R_OK; break; }
+        extern void hooks_capture(void);
+        if (ncode_alias > 0) hooks_capture();
+        pthread_mutex_lock(&g_mlock);
+        for (int i = 0; i < ncode_alias; i++)
+            if (code_alias[i].dst == x[0]) { code_alias[i] = code_alias[--ncode_alias]; break; }
+        region_remove(x[0]);
+        pthread_mutex_unlock(&g_mlock);
+        x[0] = R_OK;
         break;
     }
     default:
@@ -1483,6 +1541,8 @@ void kernel_reset(void) {
     memset(handles, 0, sizeof handles);
     nregions = 0;
     memset(lumiose_gpu_pools, 0, sizeof lumiose_gpu_pools);
+    lumiose_alias_count = 0;
+    ncode_alias = 0;  // (a code mod's views: its next boot maps them again)
     heap_size = 0;
     tls_next = TLS_BASE;
     next_thread_id = 0x50;
@@ -1529,18 +1589,33 @@ void kernel_init(void) {
     }
     // Reserve the heap, alias, stack, and TLS regions.
     region_add(TLS_BASE, TLS_SIZE, 0xC, 3);
+    // The runtime's own guest ranges, never Free to QueryMemory: Hakkun (a code mod) maps its writable views at random
+    // pages it finds Free in the ASLR region (GetInfo 12/13: the whole guest window). Not committed here: HLE_HEAP is
+    // hle_alloc's, the stub range holds fake addresses (unless LUMIOSE_TEST_MODULE needs readable RET placeholders).
+    // Only with code mods: the game alone keeps the map it always had.
     if (g_nmodules > 2) {
-        // The recomp's host functions have virtual addresses but no ARM code. Give
-        // the test a readable placeholder page to record attempted HLE hooks.
-        region_add(HLE_BASE, HLE_SIZE, 3, 5);
-        for (uint64_t off = 0; off < HLE_SIZE; off += 16)
-            *(uint32_t *)(uintptr_t)(HLE_BASE + off) = 0xd65f03c0u;  // ret
+        if (getenv("LUMIOSE_TEST_MODULE")) {
+            // The recomp's host functions have virtual addresses but no ARM code. Give
+            // the test a readable placeholder page to record attempted HLE hooks.
+            region_add(HLE_BASE, HLE_SIZE, 3, 5);
+            for (uint64_t off = 0; off < HLE_SIZE; off += 16)
+                *(uint32_t *)(uintptr_t)(HLE_BASE + off) = 0xd65f03c0u;  // ret
+        } else {
+            region_insert(HLE_BASE, HLE_SIZE, 0x3, 5);
+        }
+        region_insert(HLE_HEAP, HLE_HEAP_SIZE, 0xC, 3);  // (0xC: left out of kernel_data_regions' scans, as TLS)
     }
     for (int i = 0; i < g_nmodules; i++) {
         Module *m = &g_modules[i];
         region_add(m->base + m->text_off, m->ro_off - m->text_off, 3, 5);
         region_add(m->base + m->ro_off, m->data_off - m->ro_off, 3, 1);
         region_add(m->base + m->data_off, m->size - m->data_off, 4, 3);
+    }
+    if (g_rtld.base && g_nmodules > 2 && !getenv("LUMIOSE_TEST_MODULE")) {  // (below the guest window, already mapped: loader_map_rtld; a reboot keeps it)
+        Module *m = &g_rtld;
+        region_insert(m->base + m->text_off, m->ro_off - m->text_off, 3, 5);
+        region_insert(m->base + m->ro_off, m->data_off - m->ro_off, 3, 1);
+        region_insert(m->base + m->data_off, m->size - m->data_off, 4, 3);
     }
 }
 

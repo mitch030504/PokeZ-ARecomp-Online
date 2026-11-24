@@ -62,6 +62,21 @@ static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *ep) {
     uint64_t fa = er->ExceptionInformation[1];
     // (not for an execute fault: on a read-write page, retrying it would fault again forever)
     if (er->ExceptionInformation[0] != EXCEPTION_EXECUTE_FAULT && lazy_commit(fa)) return EXCEPTION_CONTINUE_EXECUTION;
+    // (#274: a listed game getter reading a null object - dispatch.c rt_null_getter_recover gave the caller zeros; the
+    // getter's frame is unwound by its own unwind info and the caller goes on as if it had returned)
+    extern bool rt_null_getter_recover(uint64_t pc, uint64_t fa);
+    if (er->ExceptionInformation[0] == EXCEPTION_READ_FAULT && fa < 0x10000 &&
+        rt_null_getter_recover(ep->ContextRecord->Rip, fa)) {
+        CONTEXT *cx = ep->ContextRecord;
+        DWORD64 base = 0;
+        PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(cx->Rip, &base, NULL);
+        if (rf) {
+            void *hd = NULL;
+            DWORD64 est = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, cx->Rip, rf, cx, &hd, &est, NULL);
+        } else cx->Rip = *(DWORD64 *)cx->Rsp, cx->Rsp += 8;  // (a leaf without a frame: its return address is on top)
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     extern int g_watch_write;
     g_watch_write = (int)er->ExceptionInformation[0];
     if (g_report_crashes && rt_fault_watch(fa, ep->ContextRecord->Rip)) return EXCEPTION_CONTINUE_EXECUTION;
@@ -153,8 +168,71 @@ bool plat_mem_usage(uint64_t *process, uint64_t *guest) {
             if (mi.State == MEM_COMMIT && mi.Type == MEM_PRIVATE && (ab < g_lo || ab >= g_hi)) sz += mi.RegionSize;
             if ((uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize < a) break;
         }
-        for (int i = 0; i < 16 && top[i].size; i++)
-            fprintf(stderr, "[mem] private allocation %llx: %llu MB\n", (unsigned long long)top[i].base, (unsigned long long)(top[i].size >> 20));
+        for (int i = 0; i < 16 && top[i].size; i++) {
+            fprintf(stderr, "[mem] private allocation %llx: %llu MB", (unsigned long long)top[i].base, (unsigned long long)(top[i].size >> 20));
+            // (what is in it: its first committed bytes and how much of it is non-zero, sampled every 4 KB)
+            MEMORY_BASIC_INFORMATION r;
+            uint64_t p = top[i].base, nz = 0, pages = 0;
+            for (uint64_t q = p; q < p + top[i].size + (1ull << 30) && VirtualQuery((void *)(uintptr_t)q, &r, sizeof r) &&
+                                 (uint64_t)(uintptr_t)r.AllocationBase == p; q = (uint64_t)(uintptr_t)r.BaseAddress + r.RegionSize)
+                if (r.State == MEM_COMMIT && !(r.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+                    for (uint64_t g = (uint64_t)(uintptr_t)r.BaseAddress; g < (uint64_t)(uintptr_t)r.BaseAddress + r.RegionSize; g += 4096, pages++) {
+                        const uint64_t *w = (const uint64_t *)(uintptr_t)g;
+                        if (w[0] | w[1] | w[64] | w[256]) nz++;
+                        if (pages == 0) fprintf(stderr, " | protect %lx, first %016llx %016llx %016llx %016llx", r.Protect,
+                                                (unsigned long long)w[0], (unsigned long long)w[1], (unsigned long long)w[2], (unsigned long long)w[3]);
+                    }
+            fprintf(stderr, " | %llu of %llu pages non-zero", (unsigned long long)nz, (unsigned long long)pages);
+            {   // (a heap segment's header points into the module that made the heap: named here)
+                const uint64_t *w = (const uint64_t *)(uintptr_t)p;
+                HMODULE mod = NULL;
+                char name[MAX_PATH] = "";
+                if (VirtualQuery((void *)(uintptr_t)p, &r, sizeof r) && r.State == MEM_COMMIT && !(r.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       (LPCSTR)(uintptr_t)w[3], &mod) && GetModuleFileNameA(mod, name, sizeof name))
+                    fprintf(stderr, " | header points into %s", strrchr(name, '\\') ? strrchr(name, '\\') + 1 : name);
+            }
+            fputc('\n', stderr);
+        }
+        {   // (every private allocation outside the guest window, by size: how the host share adds up)
+            static const uint64_t lim[] = {1ull << 20, 8ull << 20, 31ull << 20, 33ull << 20, 64ull << 20, 256ull << 20, ~0ull};
+            static const char *const nm[] = {"<1 MB", "1-8 MB", "8-31 MB", "32 MB", "33-64 MB", "64-256 MB", ">256 MB"};
+            uint64_t tot[7] = {0}, cnt[7] = {0}, base = 0, s = 0;
+            for (uint64_t a = 0x10000;; ) {
+                bool ok = VirtualQuery((void *)(uintptr_t)a, &mi, sizeof mi) != 0;
+                uint64_t ab = ok ? (uint64_t)(uintptr_t)mi.AllocationBase : ~0ull;
+                if (ab != base) {
+                    for (int k = 0; s && k < 7; k++) if (s < lim[k]) { tot[k] += s, cnt[k]++; break; }
+                    base = ab, s = 0;
+                }
+                if (!ok) break;
+                if (mi.State == MEM_COMMIT && mi.Type == MEM_PRIVATE && (ab < g_lo || ab >= g_hi)) s += mi.RegionSize;
+                uint64_t next = (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize;
+                if (next <= a) break;
+                a = next;
+            }
+            for (int k = 0; k < 7; k++)
+                if (cnt[k]) fprintf(stderr, "[mem] private outside the game, %s each: %llu allocations, %llu MB\n", nm[k],
+                                    (unsigned long long)cnt[k], (unsigned long long)(tot[k] >> 20));
+        }
+        // (and the process heaps - malloc's: in use per heap, and every block of 64 MB or more, so an allocation above
+        // is told apart as a malloc (its base among these) or something reserved directly, the driver's)
+        HANDLE heaps[64];
+        DWORD nh = GetProcessHeaps(64, heaps);
+        for (DWORD h = 0; h < nh && h < 64; h++) {
+            PROCESS_HEAP_ENTRY e = {0};
+            uint64_t busy = 0, nbusy = 0;
+            if (!HeapLock(heaps[h])) continue;
+            while (HeapWalk(heaps[h], &e))
+                if (e.wFlags & PROCESS_HEAP_ENTRY_BUSY) {
+                    busy += e.cbData, nbusy++;
+                    if (e.cbData >= (64u << 20))
+                        fprintf(stderr, "[mem] heap %lu block %p: %llu MB\n", (unsigned long)h, e.lpData, (unsigned long long)(e.cbData >> 20));
+                }
+            HeapUnlock(heaps[h]);
+            if (busy >> 20) fprintf(stderr, "[mem] heap %lu (%p): %llu MB in use in %llu blocks\n", (unsigned long)h, heaps[h],
+                                    (unsigned long long)(busy >> 20), (unsigned long long)nbusy);
+        }
     }
     return true;
 }
@@ -829,7 +907,17 @@ bool plat_exe_path(char *buf, size_t size) {
 }
 
 // RtlGetVersion: the real version (GetVersionEx answers what the manifest declares). Build 22000+ is Windows 11.
+// Wine / Proton: its ntdll exports wine_get_version (Windows' doesn't). The logs then say so - they showed "Windows 10"
+// for Steam Decks and Linux desktops (#165, #201) - and the start screen can say why the game code can't build there.
+const char *plat_wine_version(void) {
+    typedef const char *(CDECL * WineVersionFn)(void);
+    WineVersionFn f = (WineVersionFn)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version");
+    return f ? f() : NULL;
+}
+
 void plat_os_name(char *buf, size_t size) {
+    const char *wine = plat_wine_version();
+    if (wine) { snprintf(buf, size, "Wine %s (Linux / Steam Deck: the Windows build under Wine or Proton)", wine); return; }
     typedef LONG(WINAPI * RtlGetVersionFn)(OSVERSIONINFOW *);
     RtlGetVersionFn f = (RtlGetVersionFn)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlGetVersion");
     OSVERSIONINFOW v = {.dwOSVersionInfoSize = sizeof v};
@@ -1166,7 +1254,18 @@ ssize_t pwrite(int fd, const void *buf, size_t n, off_t off) { return prw(fd, (v
 // ---- child processes
 typedef struct { HANDLE process, job; } WinProcess;
 
-PlatProc plat_spawn(const char *const argv[], const char *log_path, bool append_log) {
+// Control Flow Guard off for one child (plat_spawn_no_cfg), as a process mitigation policy: it wins over the
+// system-wide Exploit protection setting, which the exe's header (tools/pe_no_cfg.py) does not (#337)
+#ifndef PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY
+#define PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY 0x00020007
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_OFF
+#define PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_OFF (0x00000002ull << 40)
+#endif
+
+// no_cfg: NULL = a plain start; else *no_cfg = 0 when the child runs with CFG off, or the error that prevented it
+// (then it is started without the policy)
+static PlatProc spawn_child(const char *const argv[], const char *log_path, bool append_log, unsigned long *no_cfg) {
     static __thread char cmd[32768];
     cmd[0] = 0;
     for (int i = 0; argv[i]; i++) append_arg(cmd, sizeof cmd, argv[i]);
@@ -1186,7 +1285,34 @@ PlatProc plat_spawn(const char *const argv[], const char *log_path, bool append_
     MultiByteToWideChar(CP_UTF8, 0, argv[0], -1, wprog, MAX_PATH);
     for (wchar_t *p = wprog; *p; p++) if (*p == L'/') *p = L'\\';
     const wchar_t *app = GetFullPathNameW(wprog, MAX_PATH, wfull, NULL) ? wfull : NULL;
-    BOOL ok = CreateProcessW(app, wcmd, NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, NULL, NULL, &si, &pi);
+    BOOL ok = FALSE;
+    if (no_cfg) {
+        *no_cfg = ERROR_NOT_SUPPORTED;
+        STARTUPINFOEXW six = {.StartupInfo = si};
+        six.StartupInfo.cb = sizeof six;
+        DWORD64 policy[2] = {PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_OFF, 0};
+        SIZE_T size = 0;
+        InitializeProcThreadAttributeList(NULL, 1, 0, &size);
+        six.lpAttributeList = size ? (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(size) : NULL;
+        if (!six.lpAttributeList || !InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &size)) {
+            *no_cfg = six.lpAttributeList ? GetLastError() : ERROR_NOT_ENOUGH_MEMORY;
+            free(six.lpAttributeList);
+            six.lpAttributeList = NULL;
+        } else if (!UpdateProcThreadAttribute(six.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, policy,
+                                              sizeof policy, NULL, NULL)) {
+            *no_cfg = GetLastError();
+        } else {
+            ok = CreateProcessW(app, wcmd, NULL, NULL, TRUE,
+                                CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
+                                &six.StartupInfo, &pi);
+            *no_cfg = ok ? 0 : GetLastError();  // (older Windows: ERROR_INVALID_PARAMETER; or a policy refuses it)
+        }
+        if (six.lpAttributeList) {
+            DeleteProcThreadAttributeList(six.lpAttributeList);
+            free(six.lpAttributeList);
+        }
+    }
+    if (!ok) ok = CreateProcessW(app, wcmd, NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, NULL, NULL, &si, &pi);
     if (!ok) rt_launcher_log("[plat] could not start %s (error %lu)\n", argv[0], GetLastError());
     CloseHandle(log);
     if (!ok) return 0;
@@ -1215,6 +1341,17 @@ PlatProc plat_spawn(const char *const argv[], const char *log_path, bool append_
     return (PlatProc)child;
 }
 
+PlatProc plat_spawn(const char *const argv[], const char *log_path, bool append_log) {
+    return spawn_child(argv, log_path, append_log, NULL);
+}
+
+PlatProc plat_spawn_no_cfg(const char *const argv[], const char *log_path, bool append_log, unsigned long *error) {
+    unsigned long e = 0;
+    PlatProc p = spawn_child(argv, log_path, append_log, &e);
+    if (error) *error = e;
+    return p;
+}
+
 void plat_proc_kill(PlatProc p) {
     WinProcess *child = (WinProcess *)p;
     if (child->job) TerminateJobObject(child->job, 255);
@@ -1238,6 +1375,7 @@ int plat_proc_wait(PlatProc p, bool block) {
     // a helper that dies before writing anything leaves only this: 0xC0000135 / 0xC0000142 can't load, 0xC0000005 crashed,
     // 0xC0000022 access denied, usually an antivirus; #99 had only "exit status 255" and an empty log)
     if (code > 255) rt_launcher_log("[plat] a helper process ended with status 0x%08lX\n", (unsigned long)code);
+    if (code == 0xC0000409) return PLAT_PROC_FAST_FAIL;  // (Control Flow Guard and other security checks, #337)
     return code > 255 ? 255 : (int)code;
 }
 
@@ -1385,6 +1523,18 @@ void rt_log_moved(const char *path) {
     if (!g_log_path[0] || !n || n >= sizeof full || !lock_logs()) return;
     snprintf(g_log_path, sizeof g_log_path, "%s", full);
     ReleaseMutex(g_log_mutex);
+}
+
+// This session's log file (runtime/bugrec.c packs it): the session file, or wherever stderr was sent (a tool's
+// redirect); "" when it is a console or a pipe
+const char *rt_log_file(void) {
+    static char path[MAX_PATH * 3];
+    if (g_log_path[0]) return g_log_path;
+    HANDLE h = (HANDLE)_get_osfhandle(_fileno(stderr));
+    wchar_t w[MAX_PATH];
+    DWORD n = h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_DISK ? GetFinalPathNameByHandleW(h, w, MAX_PATH, 0) : 0;
+    if (!n || n >= MAX_PATH || !WideCharToMultiByte(CP_UTF8, 0, w, -1, path, sizeof path, NULL, NULL)) return "";
+    return !strncmp(path, "\\\\?\\", 4) ? path + 4 : path;
 }
 
 // stderr still the console (no redirect: started by a double click) - main.c then logs to a file

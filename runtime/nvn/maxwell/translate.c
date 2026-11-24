@@ -20,6 +20,7 @@
 #endif
 #include <dirent.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,13 +28,31 @@
 
 #include "shader.h"
 
-uint64_t maxwell_gmem_base, maxwell_gmem_size;
-uint32_t maxwell_gmem_chunk_shift;  // 0: one buffer for the whole heap (GLSL; shader.h)
+// (these four: per thread - each translation sets its own; the shader preparation translates on several threads)
+__thread uint64_t maxwell_gmem_base, maxwell_gmem_size;
+__thread uint32_t maxwell_gmem_chunk_shift;  // 0: one buffer for the whole heap (GLSL; shader.h)
 bool maxwell_gmem_lazy;
 bool maxwell_flat_default = true;
+// (exec.c's compute sweep, #315) translate compute loads / stores / atomics on the heap only, without the device-local
+// copy of the storage buffers (gfast / gfind): one of the variants a slow compute shader is timed in. Set under
+// translate_lock; part of the translation cache key.
+bool maxwell_cs_no_gfast;
+// (the compute sweep, #315) a compute shader's `switch (pc)` state machine runs one pc a turn for the whole subgroup
+// (the first active lane's; the others wait): a uniform switch instead of a divergent one. Same results.
+bool maxwell_cs_uniform_pc;
+// Compute shaders reach the guest memory by its device address (buffer_reference: base and size in the driver
+// constants at GMEM_BDA_OFF, written by exec.c), not through the windows' descriptors - set by exec.c
+// (translate_globals_set) where the heap is windows of one import with a device address: AMD. #315: an RX 580 ran
+// Lumiose's crowd shaders at 8-24 ms each (0.3-0.7 ms on NVIDIA). AMD's compiler (RGA, gfx900) made them 122-161 KB
+// of code with every SGPR in use, the windows' descriptors and the gfast table's reloaded from VGPR lanes before
+// each access (3346-4514 v_readlane); by address and without the gfind search: 42-51 KB, 714-960. The address,
+// unlike a descriptor, has no 2 GB offset limit (the reason for the windows, #146-#151).
+bool maxwell_gmem_bda;
 bool maxwell_quad_ops;  // (vk_exec_init: the device has quad subgroup operations in fragment shaders)
+int maxwell_gather_bias_default;  // (vk_exec_init: the sub-texel bits on AMD / Intel Windows; gather_bias)
 bool maxwell_quad_deriv_default;  // (vk_exec_init: AMD; quad_deriv)
 bool maxwell_quad_control_ok, maxwell_quad_control_default;  // (vk_exec_init: the device has quad control; AMD: on)
+bool maxwell_lockstep_default = true;  // (vk_exec_init: helpers guaranteed - NVIDIA, or quad control on; quad_lockstep)
 // (vulkan/device.c: the device has shaderOutputLayer. Without it - Dozen, DirectX 12 underneath - a vertex shader's
 // render target layer is written to a local and dropped: the draw goes to layer 0 instead of its pipeline failing)
 bool maxwell_output_layer = true;
@@ -42,6 +61,7 @@ bool maxwell_output_layer = true;
 // gmir: an area past the copy of the guest window, read back and logged as "[guard]")
 uint32_t maxwell_guard_word;
 bool maxwell_gmem_fs_miss;
+__thread uint32_t maxwell_shared_bytes;
 const uint8_t *maxwell_dbg_code;
 uint32_t maxwell_dbg_pc;
 int maxwell_dbg_reg;
@@ -120,7 +140,7 @@ typedef struct {
     uint8_t pred_used[8];
     uint32_t in_attr_mask, out_attr_mask;
     uint32_t vs_in_comp[32];
-    bool uses_branches, uses_cc, uses_local, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane, uses_layer;
+    bool uses_branches, uses_cc, uses_local, uses_shared, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane, uses_layer;
     uint8_t out_comp[32];  // vertex: output components written per varying (transform feedback order)
     bool uses_rscale;  // resolution-scale table (fragment/compute only)
     bool warned_surface;  // a dropped bindless surface op was noted
@@ -185,6 +205,11 @@ static const char *pred(Ctx *c, int p, bool neg, char *buf) {
     return buf;
 }
 #define P(p, n) pred(c, (p), (n), alloca(16))
+
+// (maxwell_gmem_bda) this shader reaches the heap by address: compute, the heap in windows (not lazy chunks)
+static bool cs_bda(const Ctx *c) {
+    return maxwell_gmem_bda && c->glsl && c->stage == STAGE_COMPUTE && maxwell_gmem_chunk_shift && !maxwell_gmem_lazy;
+}
 
 static const char *cbuf_ref(Ctx *c, int idx, int64_t off, const char *dyn, char *buf) {
     c->info->cbuf_mask |= 1u << idx;
@@ -456,10 +481,22 @@ static bool quad_control_on(void) {
 // Fall-through between cases becomes a jump, so a block only starts at the top of a turn. A finished pixel waits (pc
 // 0xffffff) until the quad is done; KIL kills it after the loop. LARECOMP_SHADER_QUAD_LOCKSTEP=1 on (default), 0 off,
 // 3 test: every fragment shader with branches; 4 test: on, those shaders blue and red where a pixel waited for its
-// quad; 5 test: off, red by the turns each pixel took (the iris: rings of turns, quads split at their edges)
+// quad; 5 test: off, red by the turns each pixel took (the iris: rings of turns, quads split at their edges).
+// The quad's lowest pc counts its helper invocations (the pixels outside the triangle): it needs them to step with the
+// others. AMD without VK_KHR_shader_quad_control (every GCN card - Vega iGPUs, RX 400/500 - and drivers without it)
+// doesn't promise that: there the quad's lowest pc stayed a helper's, no real pixel could step, and the loop ran to its
+// guard - eyes cut short (solid cyan) and 9 fps whenever NPC eyes were on screen (#203, Ryzen 7 5700G's Vega 8; #189;
+// #192 RX 570 slower since v0.1.18). Simulated here with helpers that never step (6 / 7 below): 9 fps, as reported;
+// leaving helpers out of the lowest pc gave back the speed but garbled irises (their values feed the derivatives). So
+// the lockstep only runs where helpers are guaranteed: NVIDIA (seen here) or quad control on; elsewhere off - v0.1.17's eyes
+// (AMD GCN #203; Intel's frozen Ice Lake driver hung the GPU on it, #208).
+// 6 test: helpers never step, and don't count; 7 test: helpers never step and do count (v0.1.18 on GCN: the bug).
 static int quad_lockstep(void) {
     static int m = -1;
-    if (m < 0) { const char *e = getenv("LARECOMP_SHADER_QUAD_LOCKSTEP"); m = e ? atoi(e) : 1; }
+    if (m < 0) {
+        const char *e = getenv("LARECOMP_SHADER_QUAD_LOCKSTEP");
+        m = e ? atoi(e) : maxwell_lockstep_default;  // (vk_exec_init: NVIDIA, or quad control on)
+    }
     return m;
 }
 
@@ -694,8 +731,8 @@ static void write_tex_result(Ctx *c, int slot, const char *call, uint32_t mask, 
 
 // Integer texel coordinates in guest units -> the (possibly larger) allocation of texture slot `slot`.
 static const char *RSC2(Ctx *c, int slot, const char *fmt, ...) {
-    static char bufs[4][1024];
-    static int bi;
+    static __thread char bufs[4][1024];  // (per thread, as the globals above)
+    static __thread int bi;
     char *o = bufs[bi++ & 3];
     char inner[700];
     va_list ap;
@@ -959,7 +996,7 @@ static void emit_atom(Ctx *c, uint64_t w, bool red) {
     strcpy(v, R(b));
     sp(&c->body, "    { ulong ga = %s - 0x%llxul; bool ok = ga < 0x%llxul; uint old = 0u;\n", addr,
        (unsigned long long)maxwell_gmem_base, (unsigned long long)maxwell_gmem_size);
-    bool fast = c->stage == STAGE_COMPUTE;
+    bool fast = c->stage == STAGE_COMPUTE && !maxwell_cs_no_gfast && !cs_bda(c);
     if (fast) {
         c->info->uses_gmem_map = true;
         sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
@@ -1005,12 +1042,29 @@ static void emit_atom(Ctx *c, uint64_t w, bool red) {
 // over the whole image with FSR's 67% render resolution (and Dynamic resolution): the whole picture's shadows squeezed
 // into a 67% rectangle, older frames' shadows outside it (other lighting in the rectangle, a ghost of the player's
 // shadow beside it)
+//
+// Then a bias of a fraction of a texel (Ryujinx's TexturePass gather bias, the same rule): a gather whose coordinate
+// sits exactly between two texels may take either 2x2 group by the spec, and AMD's and Intel's Windows drivers take the
+// other one than the Switch (and NVIDIA): shadow edges and gathered depth then step by a texel as the camera moves.
+// The bias is 1 / (size * 2^(subTexelPrecisionBits + 1)), the least that moves a midpoint to the Switch's side.
+// LARECOMP_GATHER_BIAS=0 off, =<bits> that precision; default the device's bits on AMD / Intel Windows, else off.
+static int gather_bias(void) {
+    static int b = -1;
+    if (b < 0) { const char *e = getenv("LARECOMP_GATHER_BIAS"); b = e ? atoi(e) : maxwell_gather_bias_default; }
+    return b > 0 && b < 24 ? b : 0;
+}
+
 static void gather_uv(Ctx *c, int slot, char *xy, size_t n) {
-    if (c->stage == STAGE_VERTEX) return;
     char w[700];
-    snprintf(w, sizeof w, "uvs(%s, rscale[%d])", xy, slot + 1);
-    snprintf(xy, n, "%s", w);
-    c->uses_rscale = true;
+    if (c->stage != STAGE_VERTEX) {
+        snprintf(w, sizeof w, "uvs(%s, rscale[%d])", xy, slot + 1);
+        snprintf(xy, n, "%s", w);
+        c->uses_rscale = true;
+    }
+    if (gather_bias()) {
+        snprintf(w, sizeof w, "(%s + 1.0 / (vec2(tsize%d(0).xy) * %.1f))", xy, slot, (double)(1u << (gather_bias() + 1)));
+        snprintf(xy, n, "%s", w);
+    }
 }
 
 // TLD4S (2D gather, one component or a depth compare; per Ryujinx's EmitTexs Tld4s): x in Ra, y in Rb - or y in Ra+1
@@ -1957,7 +2011,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                                                "uint(*(device ushort *)(gmem + ga))", "uint(int(*(device short *)(gmem + ga)))"};
         int nw = size == 5 ? 2 : size >= 6 ? 4 : 1;
         bool lazy_wide = c->glsl && maxwell_gmem_chunk_shift && maxwell_gmem_lazy && nw > 1;  // (one chunk check per access)
-        if (c->glsl && c->stage == STAGE_COMPUTE) {
+        if (c->glsl && c->stage == STAGE_COMPUTE && !maxwell_cs_no_gfast && !cs_bda(c)) {
             // Compute (Vulkan): the guest heap is host memory across PCIe on a discrete GPU, and a shader storing to
             // it in a loop crawls (the little chain chomps in Madam MeowMeow's house: ~4 ms a dispatch, ~0.07 ms without
             // the heap stores). The dispatch's storage buffers are copied to a device-local buffer (gfast_, address
@@ -2089,34 +2143,44 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         icmp_expr(cmp, (int)bits(w, 49, 3), cv, "0u", bits(w, 48, 1));
         sprintf(t, "(%s ? %s : %s)", cmp, R(a), bv);
         set_reg(c, d, t);
-    } else if (OPM(0xef40000000000000ull, 0xfff8000000000000ull) || OPM(0xef50000000000000ull, 0xfff8000000000000ull)) {  // LDL / STL
-        // thread-private local memory, modelled as a word array (byte/short accesses within a word)
-        bool store = bits(w, 52, 1);
+    } else if (OPM(0xef40000000000000ull, 0xfff8000000000000ull) || OPM(0xef50000000000000ull, 0xfff8000000000000ull) ||
+               OPM(0xef48000000000000ull, 0xfff8000000000000ull) || OPM(0xef58000000000000ull, 0xfff8000000000000ull)) {
+        // LDL / STL: thread-private local memory; LDS / STS (bit 51): the workgroup's shared memory (compute only,
+        // maxwell_shared_bytes: Z-A has 3 compute shaders that use it, skipped every frame before). Both modelled
+        // as word arrays (byte / short accesses within a word); a local address wraps, a shared one is clamped (its
+        // size need not be a power of two, and Vulkan leaves an access past it undefined)
+        bool store = bits(w, 52, 1), shared = bits(w, 51, 1);
         int size = (int)bits(w, 48, 3);
         int32_t off = (int32_t)sbits(w, 20, 24);
-        c->uses_local = true;
-        char addr[128];
+        if (shared && (c->stage != STAGE_COMPUTE || !maxwell_shared_bytes)) { fail(c, "shared memory (stage %d, %u bytes)", c->stage, maxwell_shared_bytes); return; }
+        if (shared) c->uses_shared = true;
+        else c->uses_local = true;
+        const char *mem = shared ? "smem" : "lmem";
+        char fw[24];  // (the word index of %s, as a format for sp)
+        if (shared) sprintf(fw, "min(%%s, %uu)", (maxwell_shared_bytes + 3) / 4 - 1);
+        else sprintf(fw, "(%%s) & %du", LMEM_WORDS - 1);
+        char addr[128], wi[160], ix[192];
         if (a == RZ) sprintf(addr, "%du", off);
         else sprintf(addr, "(%s + %du)", R(a), (uint32_t)off);
         int nw = size == 5 ? 2 : size >= 6 ? 4 : 1;
         sp(&c->body, "    { uint la = %s;\n", addr);
-        if (!store) {
-            if (size < 4) {
+        if (size < 4) {
+            sprintf(ix, fw, "la >> 2");
+            if (!store) {
                 static const char *const ext[] = {"(v >> sh) & 0xFFu", "uint(int(char((v >> sh) & 0xFFu)))", "(v >> sh) & 0xFFFFu",
                                                   "uint(int(short((v >> sh) & 0xFFFFu)))"};
-                if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      uint v = lmem[(la >> 2) & %du]; uint sh = (la & 3u) * 8u; r%d = %s;\n", LMEM_WORDS - 1, d, ext[size]); }
+                if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      uint v = %s[%s]; uint sh = (la & 3u) * 8u; r%d = %s;\n", mem, ix, d, ext[size]); }
             } else {
-                for (int k = 0; k < nw; k++)
-                    if (d != RZ && d + k < RZ) { c->reg_used[d + k] = 1; sp(&c->body, "      r%d = lmem[((la >> 2) + %du) & %du];\n", d + k, k, LMEM_WORDS - 1); }
+                uint32_t m = size < 2 ? 0xFFu : 0xFFFFu;
+                sp(&c->body, "      uint sh = (la & 3u) * 8u; uint i = %s; %s[i] = (%s[i] & ~(0x%xu << sh)) | ((%s & 0x%xu) << sh);\n",
+                   ix, mem, mem, m, R(d), m);
             }
         } else {
-            if (size < 4) {
-                uint32_t m = size < 2 ? 0xFFu : 0xFFFFu;
-                sp(&c->body, "      uint sh = (la & 3u) * 8u; uint i = (la >> 2) & %du; lmem[i] = (lmem[i] & ~(0x%xu << sh)) | ((%s & 0x%xu) << sh);\n",
-                   LMEM_WORDS - 1, m, R(d), m);
-            } else {
-                for (int k = 0; k < nw; k++)
-                    sp(&c->body, "      lmem[((la >> 2) + %du) & %du] = %s;\n", k, LMEM_WORDS - 1, R(d == RZ ? RZ : d + k));
+            for (int k = 0; k < nw; k++) {
+                sprintf(wi, "(la >> 2) + %du", k);
+                sprintf(ix, fw, wi);
+                if (store) sp(&c->body, "      %s[%s] = %s;\n", mem, ix, R(d == RZ ? RZ : d + k));
+                else if (d != RZ && d + k < RZ) { c->reg_used[d + k] = 1; sp(&c->body, "      r%d = %s[%s];\n", d + k, mem, ix); }
             }
         }
         sp(&c->body, "    }\n");
@@ -2669,7 +2733,11 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     Str s = {0};
     sp(&s, "#version 460\n");  // (the prelude's first line; an extension directive has to follow it)
     if (c->full_quads) sp(&s, "#extension GL_EXT_shader_quad_control : require\n#extension GL_EXT_maximal_reconvergence : require\n");
-    if (info->uses_gmem && maxwell_gmem_chunk_shift && maxwell_gmem_lazy) sp(&s, "#extension GL_EXT_buffer_reference : require\n");
+    if (info->uses_gmem && maxwell_gmem_chunk_shift && (maxwell_gmem_lazy || cs_bda(c))) sp(&s, "#extension GL_EXT_buffer_reference : require\n");
+    if (info->uses_gmem && cs_bda(c)) {  // (the base address and size in the driver constants: cb0 declared that far)
+        info->cbuf_mask |= 1u;
+        if (c->cbuf_need[0] < GMEM_BDA_OFF / 16 + 1) c->cbuf_need[0] = GMEM_BDA_OFF / 16 + 1;
+    }
     {   // (test) LARECOMP_WARP_FORCE_EMU=1: the 64-lane warp code even on 32-lane subgroups (it must change nothing there)
         const char *pre = glsl_prelude + sizeof "#version 460\n" - 1;
         static int force = -1;
@@ -2697,6 +2765,24 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (c->uses_gmem_store)
             sp(&s, "#define GMW(i, v) gmem_.w[i] = (v)\n#define GMAND(i, m) atomicAnd(gmem_.w[i], m)\n"
                    "#define GMOR(i, m) atomicOr(gmem_.w[i], m)\n");
+    } else if (info->uses_gmem && cs_bda(c)) {  // the heap by its device address (maxwell_gmem_bda): no descriptor
+        const int q = GMEM_BDA_OFF / 16;
+        sp(&s, "layout(buffer_reference, std430, buffer_reference_align = 4) buffer GW_ { uint w; };\n");
+        sp(&s, "#define GP_(i) GW_((uint64_t(cb0[%d].y) << 32 | uint64_t(cb0[%d].x)) + uint64_t(i) * 4ul).w\n", q, q);
+        sp(&s, "#define GIN_(i) ((i) < cb0[%d].z)\n", q);  // (inside the import: as a window past it read zero)
+        sp(&s, "uint GMR_(uint i) { return GIN_(i) ? GP_(i) : 0u; }\n#define GMR(i) GMR_(i)\n");
+        if (c->uses_gmem_store) {
+            sp(&s, "void GMW_(uint i, uint v) { if (GIN_(i)) GP_(i) = v; }\n"
+                   "void GMAND_(uint i, uint v) { if (GIN_(i)) atomicAnd(GP_(i), v); }\n"
+                   "void GMOR_(uint i, uint v) { if (GIN_(i)) atomicOr(GP_(i), v); }\n"
+                   "#define GMW(i, v) GMW_(i, v)\n#define GMAND(i, m) GMAND_(i, m)\n#define GMOR(i, m) GMOR_(i, m)\n");
+            static const char *const am[][2] = {{"GMA_ADD", "atomicAdd"}, {"GMA_MIN", "atomicMin"}, {"GMA_MAX", "atomicMax"},
+                                                {"GMA_AND", "atomicAnd"}, {"GMA_OR", "atomicOr"}, {"GMA_XOR", "atomicXor"},
+                                                {"GMA_XCH", "atomicExchange"}};
+            for (size_t op = 0; op < sizeof am / sizeof am[0]; op++)
+                sp(&s, "uint %s(uint i, uint v) { return GIN_(i) ? %s(GP_(i), v) : 0u; }\n", am[op][0], am[op][1]);
+            sp(&s, "uint GMCAS(uint i, uint cmp, uint v) { return GIN_(i) ? atomicCompSwap(GP_(i), cmp, v) : 0u; }\n");
+        }
     } else if (info->uses_gmem && !maxwell_gmem_lazy) {  // the heap in windows, one binding each, plain branches (shader.h)
         int n = maxwell_gmem_chunks(), ws = (int)maxwell_gmem_chunk_shift - 2, cs = GMEM_CHUNK_SET(stage);
         for (int k = 0; k < n; k++)
@@ -2867,6 +2953,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (c->full_quads) sp(&s, "layout(full_quads) in;\nlayout(quad_derivatives) in;\n");  // (quad_control_on)
     } else {
         sp(&s, "layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;\n");
+        if (c->uses_shared) sp(&s, "shared uint smem[%u];\n", (maxwell_shared_bytes + 3) / 4);
     }
     sp(&s, c->full_quads ? "void main() [[maximally_reconverges]] {\n" : "void main() {\n");
     if (stage == STAGE_VERTEX) {
@@ -2897,11 +2984,15 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         bool report = maxwell_guard_word && c->stage == STAGE_COMPUTE && c->info->uses_gmem;
         sp(&s, "  uint guard = 0u;\n  for (; guard < %uu; guard++) {\n", loop_guard());
         if (c->quad_lockstep && quad_lockstep() != 5) {  // (the quad's lowest pc runs, the others wait: quad_lockstep)
-            sp(&s, "  { float pf_ = float(min(pc, 16777215u));\n"
+            sp(&s, quad_lockstep() != 6 ? "  { float pf_ = float(min(pc, 16777215u));\n"
+                                        : "  { float pf_ = gl_HelperInvocation ? 16777215.0f : float(min(pc, 16777215u));\n");
+            sp(&s, "%s"
                    "    float m_ = min(pf_, pf_ + dFdxFine(pf_) * ((uint(gl_FragCoord.x) & 1u) == 0u ? 1.0f : -1.0f));\n"
                    "    m_ = min(m_, m_ + dFdyFine(m_) * ((uint(gl_FragCoord.y) & 1u) == 0u ? 1.0f : -1.0f));\n"
                    "    if (m_ >= 16777215.0f) break;\n    if (float(min(pc, 16777215u)) != m_) { %scontinue; } }\n",
-               quad_lockstep() == 4 ? "waited_ = true; " : "");
+               "", quad_lockstep() == 4 ? "waited_ = true; " : "");
+            if (quad_lockstep() == 6 || quad_lockstep() == 7)  // (test: helpers never step, as on AMD without quad control)
+                sp(&s, "  if (gl_HelperInvocation) continue;\n");
             // a case's fall-through into the next one: a jump, so the next block starts at the top of a turn
             const char *b = body.buf ? body.buf : "";
             bool first = true;
@@ -2920,6 +3011,29 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
             if (first) sp(&s, "  switch (pc) {\n");
             sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n"
                    "  if (exit_now) { pc = 16777215u; exit_now = false; }\n  }\n");
+        } else if (c->stage == STAGE_COMPUTE && maxwell_cs_uniform_pc) {
+            // (the compute sweep's uniform variant, #315: an RX 580 ran Lumiose's crowd shaders - BRX jump tables, so
+            // never straight-line - at 8-24 ms each, a divergent switch of ~70 cases in 64-lane waves. Here one pc a
+            // turn, the first active lane's, for the subgroup: the switch is uniform, lanes elsewhere wait - their turn
+            // isn't counted by the guard. Fall-throughs become jumps, so the next block starts a turn as with
+            // quad_lockstep.)
+            sp(&s, "  uint up_ = subgroupBroadcastFirst(pc);\n  if (pc != up_) { guard--; continue; }\n");
+            const char *b = body.buf ? body.buf : "";
+            bool first = true;
+            for (const char *l = b; *l;) {
+                const char *nl = strchr(l, '\n');
+                size_t n = nl ? (size_t)(nl - l + 1) : strlen(l);
+                unsigned cpc;
+                if (!strncmp(l, "  case ", 7) && sscanf(l + 7, "%uu:", &cpc) == 1) {
+                    if (!first) sp(&s, "    pc = %uu; continue;\n", cpc);
+                    if (first) sp(&s, "  switch (up_) {\n");
+                    first = false;
+                }
+                sp(&s, "%.*s", (int)n, l);
+                l += n;
+            }
+            if (first) sp(&s, "  switch (up_) {\n");
+            sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now) break;\n  }\n");
         } else {
             sp(&s, "  switch (pc) {\n");
             sp(&s, "%s", body.buf ? body.buf : "");
@@ -3280,6 +3394,7 @@ static ShaderInfo *translate(const uint8_t *blob, size_t max_size, int stage, co
         if (c->pred_used[i]) sp(&s, "  bool p%d = false;\n", i);
     if (c->uses_cc) sp(&s, "  uint cc = 0; bool ccz = false, ccs = false;\n");
     if (c->uses_local) sp(&s, "  uint lmem[%d] = {};\n", LMEM_WORDS);
+    if (c->uses_shared) sp(&s, "  threadgroup uint smem[%u];\n", (maxwell_shared_bytes + 3) / 4);
     if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy_0 = 0u; uint ssy_1 = 0u; uint ssy_2 = 0u; uint ssy_3 = 0u; uint ssy_4 = 0u; uint ssy_5 = 0u; uint ssy_6 = 0u; uint ssy_7 = 0u; uint ssy_8 = 0u; uint ssy_9 = 0u; uint ssy_10 = 0u; uint ssy_11 = 0u; uint ssy_12 = 0u; uint ssy_13 = 0u; uint ssy_14 = 0u; uint ssy_15 = 0u; uint pbk_0 = 0u; uint pbk_1 = 0u; uint pbk_2 = 0u; uint pbk_3 = 0u; uint pbk_4 = 0u; uint pbk_5 = 0u; uint pbk_6 = 0u; uint pbk_7 = 0u; uint pbk_8 = 0u; uint pbk_9 = 0u; uint pbk_10 = 0u; uint pbk_11 = 0u; uint pbk_12 = 0u; uint pbk_13 = 0u; uint pbk_14 = 0u; uint pbk_15 = 0u; uint pcnt_0 = 0u;\n");
@@ -3358,7 +3473,7 @@ void maxwell_disassemble(const uint8_t *code, size_t max_size, int stage, void *
 // jump table is read from past the code) or a header past max_size, and the debug switches, go uncached. On when the
 // runtime sets maxwell_disk_cache (not in the tools and tests); LARECOMP_NO_TRANSLATE_CACHE=1: off (and with
 // LARECOMP_SHADER_FLAT set, which changes the translations without changing the key).
-// (called under the runtime's translate lock, as the translator itself)
+// (called on several threads at once by the shader preparation: vulkan/exec.c prep_translate)
 bool maxwell_disk_cache;
 #ifdef SHADER_TRANSLATOR_ID
 static const char cache_build[] = SHADER_TRANSLATOR_ID;
@@ -3392,14 +3507,18 @@ static void cache_open(void) {
     if ((f = fopen("cache/maxwell/build", "wb"))) { fwrite(cache_build, 1, sizeof cache_build, f); fclose(f); }
 }
 
+static bool cache_on;
+static void cache_init(void) {
+    cache_on = maxwell_disk_cache && !getenv("LARECOMP_NO_TRANSLATE_CACHE") && !getenv("LARECOMP_NO_DISCARD") &&
+               !getenv("LARECOMP_LANE_COMPUTE_ONLY") && !getenv("LARECOMP_BRX_ALL_LABELS") && !getenv("LARECOMP_SAVE_MSL");
+    if (cache_on) cache_open();
+}
 static uint64_t cache_key(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
-    static int on = -1;
-    if (on < 0) {
-        on = maxwell_disk_cache && !getenv("LARECOMP_NO_TRANSLATE_CACHE") && !getenv("LARECOMP_NO_DISCARD") &&
-             !getenv("LARECOMP_LANE_COMPUTE_ONLY") && !getenv("LARECOMP_BRX_ALL_LABELS") && !getenv("LARECOMP_SAVE_MSL");
-        if (on) cache_open();
-    }
-    if (!on || !key || maxwell_dbg_code || maxwell_dbg_vs) return 0;
+    // (once, before any translation stores: the preparation's first translations run on several threads at once, and
+    // one emptying the folder while the others store lost their translations)
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, cache_init);
+    if (!cache_on || !key || maxwell_dbg_code || maxwell_dbg_vs) return 0;
     const uint8_t *code = code_start(blob, stage);
     if (max_size <= (size_t)(code - blob)) return 0;
     size_t end = code_end(blob, code, max_size);
@@ -3407,7 +3526,7 @@ static uint64_t cache_key(const uint8_t *blob, size_t max_size, int stage, const
         if ((((const uint64_t *)code)[i] & 0xfff0000000000000ull) == 0xe250000000000000ull) return 0;  // BRX
     // (the straight-line switch is in the key: on and off translations of one shader differ, and a GPU that changes
     // the default - AMD - or a player's LARECOMP_SHADER_FLAT must not load the other form)
-    uint64_t v[6] = {(uint64_t)stage, max_size, maxwell_gmem_base, maxwell_gmem_size, (uint64_t)maxwell_flat_on() | (uint64_t)loop_guard() << 8 | (uint64_t)maxwell_guard_word << 32, (uint64_t)quad_on() + 2 + 16 * (uint64_t)quad_deriv() + 64 * (uint64_t)!maxwell_output_layer + 128 * (uint64_t)quad_control_on() + 256 * (uint64_t)quad_lockstep()};
+    uint64_t v[7] = {(uint64_t)stage, max_size, maxwell_gmem_base, maxwell_gmem_size, (uint64_t)maxwell_flat_on() | (uint64_t)loop_guard() << 8 | (uint64_t)maxwell_guard_word << 32 | (uint64_t)maxwell_cs_no_gfast << 40 | (uint64_t)maxwell_cs_uniform_pc << 41 | (uint64_t)maxwell_gmem_bda << 42, (uint64_t)quad_on() + 2 + 16 * (uint64_t)quad_deriv() + 64 * (uint64_t)!maxwell_output_layer + 128 * (uint64_t)quad_control_on() + 256 * (uint64_t)quad_lockstep(), stage == STAGE_COMPUTE ? maxwell_shared_bytes : 0};
     uint64_t h = fnv(fnv(fnv(0xcbf29ce484222325ull, cache_build, sizeof cache_build), v, sizeof v), key, sizeof *key);
     h = fnv(h, blob, (size_t)(code - blob) + end * 8);
     return h ? h : 1;

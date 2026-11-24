@@ -32,22 +32,6 @@ Steam with Steam Input on, the game sees Steam's virtual Xbox controller (Xbox p
 If the AppImage won't start with a FUSE error, install your distribution's `fuse3` package, or run it with
 `APPIMAGE_EXTRACT_AND_RUN=1`. On a Steam Deck, put `APPIMAGE_EXTRACT_AND_RUN=1 %command%` in the game's launch options.
 
-### AMD RDNA4 and Mesa 27.0-devel
-
-On Radeon RX 9000 (RDNA4, `GFX1201`) older Mesa `27.0.0-devel` RADV builds (`mesa-git`) crashed inside
-`libvulkan_radeon` at the game's first draw: `radv_shader_part_cache_get()` dereferenced a NULL `cache->ops` because
-`device->ps_epilogs` had never been initialized. RADV 27 initializes that cache only when one of the dynamic-state
-feature bits is enabled, but extended dynamic state 1 is **core** in Vulkan 1.3 and the renderer (correctly) used it
-without enabling the promoted extension's feature struct. Mesa 26.2.6 did not have the gating, so it worked.
-
-The renderer works around this by enabling the promoted `VK_EXT_extended_dynamic_state` extension and its feature bit
-on RADV Vulkan 1.3 devices too; the commands remain the core ones. This is legal and makes RADV initialize the cache. Other 1.3 drivers keep their previous feature chain.
-Mesa 26.2.6 and current mesa-git both run the game. The correct driver-side fix is to initialize `ps_epilogs`
-unconditionally (or for `VK_API_VERSION_1_3`); a local build with that change runs the original binary too.
-
-No stable-driver downgrade is needed. `LARECOMP_VK_COMPAT=1` (the Vulkan 1.2 path) also avoids it if you need a quick
-comparison run.
-
 ### FSR 4.1.2 temporal upscaling (optional, Linux)
 
 F1 > Video > Temporal anti-aliasing > **AMD FSR 4.1.2** runs AMD's FSR 4.1.2 through a user-supplied Linux provider,
@@ -285,3 +269,15 @@ player's own packages (base game + update).
 - The start screen in a tiny bitmap font: run a dev build from the repo root (its resources are looked up from the
   starting folder; the AppImage keeps them next to the executable).
 - A black screenshot in a test run: a fade between scenes (the log shows about one draw per frame there).
+
+### AMD RDNA4 and Mesa 27.0-devel
+
+RADV 27 initializes its PS epilog cache (`device->ps_epilogs`) only when a dynamic-state extension feature bit is set.
+Extended dynamic state 1 is **core** in Vulkan 1.3, so a Vulkan 1.3 application can use it without enabling the
+promoted extension's feature bit. Mesa 27.0-devel's RADV then left the cache uninitialized and the first 3-vertex draw
+crashed in `radv_shader_part_cache_get()` (GFX1201, Radeon RX 9070).
+
+The renderer enables the promoted `VK_EXT_extended_dynamic_state` feature on RADV Vulkan 1.3 devices; the commands stay
+the core ones. Other 1.3 drivers keep their previous feature chain. Mesa 26.2.6 (stable) and current mesa-git both run
+the game. The driver-side fix is to initialize `ps_epilogs` unconditionally (or for `VK_API_VERSION_1_3`); a local Mesa
+build with that change runs the original, unpatched binary too.
