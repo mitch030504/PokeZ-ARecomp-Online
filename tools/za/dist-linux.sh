@@ -192,7 +192,7 @@ Depends: libc6 (>= $GLIBC), libstdc++6, libgcc-s1, libvulkan1
 Recommends: mesa-vulkan-drivers | vulkan-icd
 Section: games
 Priority: optional
-Homepage: https://github.com/Hexveil404/PokeZ-ARecomp
+Homepage: https://github.com/mitch030504/PokeZ-ARecomp-Online
 Description: Pokémon Legends: Z-A, recompiled for PC (bring your own game files)
  ZA Recomp is a static-recompilation PC port. No game code or game files are
  included: the start screen reads your own .xci / .nsp with your prod.keys and

@@ -18,7 +18,7 @@ ASSET = 'Lumiose-Online-linux-experimental.zip'
 PREFIX = 'Lumiose Online Linux/'
 MAX_BYTES = 4 * 1024**3
 PROGRAM_DIRS = {'docs', 'gamelib-src', 'lasgen', 'python', 'python-deps', 'runtime', 'tools', 'zaimport', 'zaprompts', 'zig'}
-PROGRAM_FILES = {'lasrecomp', 'icon.png', 'za-default.ini', 'LICENSE', 'README.md', 'README.pt-BR.md',
+PROGRAM_FILES = {'lasrecomp', 'icon.png', 'za-default.ini', 'LICENSE', 'README.md', 'README.pt-BR.md', 'CHANGELOG.md',
                  'README-Windows-reference.md', 'RNNOISE-LICENSE.txt', 'Baloo2-OFL.txt', 'Baloo2-SemiBold.ttf',
                  'BIZUDPGothic-OFL.txt', 'BIZUDPGothic-Regular.ttf', 'DejaVu-LICENSE.txt',
                  'DejaVuSans.ttf', 'DejaVuSans-Bold.ttf'}

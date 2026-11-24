@@ -1,0 +1,196 @@
+name: Release (Windows & Linux)
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (defaults to LARECOMP_VERSION from runtime/ui/launcher.mm)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Ubuntu 22.04 packaging image
+        run: docker build -t za-linux-build -f tools/linux/Containerfile tools/linux
+      - name: Build and package Lumiose-Online-linux-experimental.zip
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src za-linux-build bash -euo pipefail -c '
+            git config --global --add safe.directory /src
+            apt-get update -qq
+            apt-get install -y --no-install-recommends dotnet-sdk-8.0 python3-venv zip
+            JOBS=4 PYTHON=python3.12 ZIP=0 DEB=0 tools/za/dist-linux.sh
+            bash tools/lumiose/package_linux.sh
+            d="$PWD/build/dist/Lumiose Online Linux/usr/bin"
+            probe="$PWD/build/linux/direct-entry-test"
+            mkdir -p "$probe/usr/bin/lumiose"
+            cp "$d/lasrecomp" "$probe/usr/bin/lasrecomp"
+            touch "$probe/usr/bin/lumiose/subsdk9"
+            printf "#!/bin/sh\n: > \"\$LUMIOSE_ENTRY_PROBE\"\n" > "$probe/Lumiose Online"
+            LUMIOSE_ENTRY_PROBE="$probe/ran" LD_LIBRARY_PATH="$d/../lib" "$probe/usr/bin/lasrecomp"
+            test -f "$probe/ran"
+            echo "Direct runtime launch correctly routes through the Lumiose launcher."
+            cd build/dist
+            zip -qry Lumiose-Online-linux-experimental.zip "Lumiose Online Linux"
+            copy="$PWD/update-smoke"
+            cp -a "Lumiose Online Linux" "$copy"
+            mkdir -p "$copy/usr/bin/save"
+            echo preserved > "$copy/usr/bin/save/main"
+            LUMIOSE_UPDATE_SMOKE_ROOT="$copy" LUMIOSE_UPDATE_SMOKE_ZIP="$PWD/Lumiose-Online-linux-experimental.zip" \
+              PYTHONPATH="$d/tools/lumiose" "$d/python/bin/python3.12" -c "import os; from pathlib import Path; import linux_launcher_update as u; root=Path(os.environ[\"LUMIOSE_UPDATE_SMOKE_ROOT\"]); u.install(root, os.environ[\"LUMIOSE_UPDATE_SMOKE_ZIP\"]); assert (root / \"usr/bin/save/main\").read_text().strip() == \"preserved\"; print(\"Full package update preserved the save\")"
+            sha256sum Lumiose-Online-linux-experimental.zip > Lumiose-Online-linux-experimental.zip.sha256
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: |
+            build/dist/Lumiose-Online-linux-experimental.zip
+            build/dist/Lumiose-Online-linux-experimental.zip.sha256
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: LF line endings
+        shell: pwsh
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        id: py312
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: make git python unzip bison flex
+          pacboy: >-
+            clang:p lld:p binutils:p gcc:p nasm:p meson:p ninja:p
+            python-mako:p python-yaml:p python-packaging:p directx-headers:p
+            sdl3:p vulkan-devel:p shaderc:p spirv-tools:p
+            pkgconf:p vulkan-memory-allocator:p
+      - name: Build ZA Recomp support tools, DirectX 12 Dozen, and runtime
+        env:
+          PY312_WIN: ${{ steps.py312.outputs.python-path }}
+        run: |
+          export PATH="/ucrt64/bin:/usr/bin:${DOTNET_ROOT:+$(cygpath -u "$DOTNET_ROOT"):}/c/Program Files/dotnet:$PATH"
+          dotnet --version
+          PY312="$(cygpath -u "$PY312_WIN")"
+          export PY312
+          bash tools/za/dist.sh
+      - name: Build Lumiose Online.exe and model-preview renderer
+        run: |
+          export PATH="/ucrt64/bin:/usr/bin:${DOTNET_ROOT:+$(cygpath -u "$DOTNET_ROOT"):}/c/Program Files/dotnet:$PATH"
+          mkdir -p build/win-lumiose-release
+          cp build/za-dist/lasrecomp.exe build/za-dist/lasrecomp.dll.a build/win-lumiose-release/
+          windres -I assets -I runtime/platform -O coff tools/lumiose/windows_launcher.rc -o build/win-lumiose-release/windows_launcher_rc.o
+          clang -O2 -mwindows -municode tools/lumiose/windows_launcher.c build/win-lumiose-release/windows_launcher_rc.o \
+            -o "build/win-lumiose-release/Lumiose Online.exe"
+          dotnet restore third_party/lumiose_model_preview/UiModelProbe/UiModelProbe.csproj -r win-x64
+          dotnet publish third_party/lumiose_model_preview/UiModelProbe/UiModelProbe.csproj -c Release -r win-x64 \
+            --self-contained true --no-restore -o "build/dist-za/ZA Recomp/lumiose/model-renderer" \
+            -p:UseSharedCompilation=false --disable-build-servers
+          mkdir -p "build/dist-za/ZA Recomp/THIRD-PARTY-NOTICES"
+          cp third_party/lumiose_model_preview/LICENSE "build/dist-za/ZA Recomp/THIRD-PARTY-NOTICES/GFTool-GPLv2-LICENSE.txt"
+          cp third_party/lumiose_model_preview/third_party/BntxLibrary/LICENSE "build/dist-za/ZA Recomp/THIRD-PARTY-NOTICES/BntxLibrary-MIT-LICENSE.txt"
+          cp third_party/lumiose_model_preview/third_party/BntxLibrary/PROVENANCE.txt "build/dist-za/ZA Recomp/THIRD-PARTY-NOTICES/BntxLibrary-PROVENANCE.txt"
+          cp third_party/ooz/COPYING "build/dist-za/ZA Recomp/THIRD-PARTY-NOTICES/ooz-GPLv3-COPYING.txt"
+          cp third_party/rnnoise/COPYING "build/dist-za/ZA Recomp/THIRD-PARTY-NOTICES/rnnoise-COPYING.txt"
+          cp third_party/ffx_api/LICENSE.md "build/dist-za/ZA Recomp/THIRD-PARTY-NOTICES/AMD-FSR-LICENSE.md"
+      - name: Package ZA-Recomp-windows.zip
+        env:
+          PY312_WIN: ${{ steps.py312.outputs.python-path }}
+        run: |
+          PY312="$(cygpath -u "$PY312_WIN")"
+          PYDIR="$(dirname "$PY312")"
+          [ -f "$PYDIR/LICENSE.txt" ] || cp LICENSE "$PYDIR/LICENSE.txt"
+          "$PY312" -m pip install -q --target build/win-python-deps capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5
+          rm -rf build/dist-lumiose
+          "$PY312" tools/lumiose/package_release.py \
+            --support "build/dist-za/ZA Recomp" \
+            --python "$PYDIR" \
+            --deps build/win-python-deps \
+            --build-dir build/win-lumiose-release \
+            --out "build/dist-lumiose/ZA Recomp"
+          (cd build/dist-lumiose && /c/Windows/System32/tar.exe -a -cf ZA-Recomp-windows.zip "ZA Recomp" && \
+            sha256sum ZA-Recomp-windows.zip > ZA-Recomp-windows.zip.sha256)
+          ls -la build/dist-lumiose/ZA-Recomp-windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: |
+            build/dist-lumiose/ZA-Recomp-windows.zip
+            build/dist-lumiose/ZA-Recomp-windows.zip.sha256
+            build/release-gamelib.txt
+          if-no-files-found: error
+
+  publish:
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          elif [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="$(sed -n 's/^#define LARECOMP_VERSION "\(.*\)"/\1/p' runtime/ui/launcher.mm)"
+          fi
+          echo "Publishing release: $TAG"
+          python3 - "$TAG" release-artifacts/release-gamelib.txt release-notes.md <<'PY'
+          import re, sys
+          from pathlib import Path
+          tag, marker_path, out_path = sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3])
+          changelog = Path('CHANGELOG.md').read_text(encoding='utf-8')
+          m = re.search(rf'^## \[{re.escape(tag)}\][^\n]*\n(.*?)(?=\n^## \[|\n^---|\Z)', changelog, re.M | re.S)
+          body = m.group(1).strip() if m else f'Release {tag}. See CHANGELOG.md for details.'
+          marker = marker_path.read_text(encoding='utf-8').strip() if marker_path.is_file() else ''
+          notes = (
+              f'# ZA Recomp – Lumiose Online {tag}\n\n'
+              f'{body}\n\n'
+              '### Assets\n'
+              '- **Windows**: `ZA-Recomp-windows.zip` (extract and run `Lumiose Online.exe`, or use **Update now**)\n'
+              '- **Linux (x86-64)**: `Lumiose-Online-linux-experimental.zip` (extract and run `Lumiose Online`, or use **Update now**)\n\n'
+              f'{marker}\n'
+          )
+          out_path.write_text(notes, encoding='utf-8')
+          PY
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "Lumiose Online for ZA Recomp $TAG" --notes-file release-notes.md
+            gh release upload "$TAG" --clobber \
+              release-artifacts/ZA-Recomp-windows.zip \
+              release-artifacts/ZA-Recomp-windows.zip.sha256 \
+              release-artifacts/Lumiose-Online-linux-experimental.zip \
+              release-artifacts/Lumiose-Online-linux-experimental.zip.sha256
+          else
+            gh release create "$TAG" \
+              --title "Lumiose Online for ZA Recomp $TAG" \
+              --notes-file release-notes.md \
+              release-artifacts/ZA-Recomp-windows.zip \
+              release-artifacts/ZA-Recomp-windows.zip.sha256 \
+              release-artifacts/Lumiose-Online-linux-experimental.zip \
+              release-artifacts/Lumiose-Online-linux-experimental.zip.sha256
+          fi

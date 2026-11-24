@@ -2,21 +2,26 @@
 
 <img src="docs/icon/icon_1024.png" alt="ZA Recomp" width="128">
 
-# ZA Recomp
+# ZA Recomp - Lumiose Online
 
-**Um port nativo para PC de *Pokémon Legends: Z-A*, feito por recompilação estática.**
+**Um port nativo para PC de *Pokémon Legends: Z-A* com suporte ao Lumiose Online, feito por recompilação estática.**
 
 [English](README.md) · **Português (Brasil)**
 
-[Download](https://github.com/Hexveil404/PokeZ-ARecomp/releases/latest) ·
-[Relatar um bug](https://github.com/Hexveil404/PokeZ-ARecomp/issues) ·
+[Download](https://github.com/mitch030504/PokeZ-ARecomp-Online/releases/latest) ·
+[Changelog](CHANGELOG.md) ·
+[Relatar um bug](https://github.com/mitch030504/PokeZ-ARecomp-Online/issues) ·
 [Port para macOS (MonZaMac)](https://github.com/lucabravi/MonZaMac)
 
 </div>
 
 ---
 
-O ZA Recomp transforma o código do jogo do Nintendo Switch em um programa nativo do Windows. O código ARM64 é
+Este repositório é um fork mantido do **[Hexveil404/PokeZ-ARecomp](https://github.com/Hexveil404/PokeZ-ARecomp)** que
+combina as versões upstream do ZA Recomp com a integração do **Lumiose Online**, controles nativos de PC (teclado e
+mouse) e melhorias de Switch 2 Edition (`.nup`) / Linux RADV e FSR 4.
+
+O ZA Recomp transforma o código do jogo do Nintendo Switch em um programa nativo para PC. O código ARM64 é
 traduzido antecipadamente para C e compilado para x86-64 no seu PC, e o sistema operacional e a GPU (NVN) do Switch
 são reimplementados sobre Vulkan. Nenhum emulador roda enquanto você joga.
 
@@ -74,8 +79,8 @@ para *The Legend of Zelda: Link's Awakening*.
 - Qualquer controle do SDL3: Xbox, PlayStation (DualShock 4 / DualSense), Switch Pro, Steam Deck e outros
 - Teclado e mouse, com câmera pelo mouse
 - Todos os botões e teclas podem ser remapeados; os ícones dos botões seguem o seu controle (Xbox, PlayStation,
-  Nintendo, Steam Deck, teclado). Controles Xbox / PlayStation / Steam usam os próprios rótulos A/B/X/Y; controles
-  Nintendo mantêm as posições do Switch
+  Nintendo, Steam Deck, teclado). Predefinições de layout para controles Xbox / PlayStation / Nintendo configuram os
+  botões frontais e prompts automaticamente na primeira execução (e podem ser ajustados em **F1 > Controles**)
 - No nome, A digita, B apaga, Start / Menu confirma (ou selecione OK); teclado na tela para qualquer controle conectado
 - Golpes por posição e encaixe do analógico direito no eixo
 
@@ -101,7 +106,7 @@ No Mac, use o [MonZaMac](https://github.com/lucabravi/MonZaMac), do
 
 ## Instalação
 
-1. Baixe o `ZA-Recomp-windows.zip` mais recente em [Releases](https://github.com/Hexveil404/PokeZ-ARecomp/releases/latest)
+1. Baixe o `ZA-Recomp-windows.zip` mais recente em [Releases](https://github.com/mitch030504/PokeZ-ARecomp-Online/releases/latest)
    e extraia em uma pasta à sua escolha (por exemplo `C:\Jogos\ZA Recomp`).
 2. Deixe a sua própria cópia do jogo em uma pasta, de um destes jeitos:
    - **Jogo extraído**: as pastas `exefs` e `romfs`, como um emulador ou o seu Switch extraem. Não precisa de keys.
@@ -169,8 +174,8 @@ são para Ubuntu / Linux Mint / Debian; nas outras distribuições os pacotes t�
 2. Baixe o código e gere o AppImage (na primeira vez ele baixa e compila as bibliotecas, o que demora um pouco):
 
    ```bash
-   git clone https://github.com/Hexveil404/PokeZ-ARecomp.git
-   cd PokeZ-ARecomp
+   git clone https://github.com/mitch030504/PokeZ-ARecomp-Online.git
+   cd PokeZ-ARecomp-Online
    tools/za/dist-linux.sh
    ```
 
@@ -241,7 +246,9 @@ Mods que trocam arquivos do jogo (uma pasta `romfs`): traduções, texturas, mod
 arraste o mod para a janela); eles ficam em `mods/`. Quando dois mods trocam o mesmo arquivo, vale o que está mais
 acima na lista.
 
-Mods que mudam o código do jogo (`exefs`, patches IPS, plugins de cheats) não funcionam num jogo recompilado.
+Mods de código (`exefs/subsdk0-9` exlaunch / Hakkun e patches `.pchtxt`) também são suportados e podem ser ativados por
+mod na página **Mods** (desligados por padrão; ativar compila a biblioteca do mod uma vez). Patches IPS legados e
+plugins de cheats fora desse formato não são suportados.
 
 ### Tradução para português do Brasil
 
@@ -351,7 +358,7 @@ renderizador no driver **DirectX 12** da placa, o que ajuda quando o driver Vulk
   o que faz o RADV inicializar o cache. Mesa 26.2.6 (estável) e o mesa-git atual funcionam; não é preciso voltar para
   o driver estável. Veja [docs/linux.md](docs/linux.md#amd-rdna4-and-mesa-270-devel).
 - **Fps baixo**: diminua a resolução interna ou ligue a resolução Dinâmica, e desligue os recursos gráficos opcionais.
-- **Relatar um bug**: [abra uma issue](https://github.com/Hexveil404/PokeZ-ARecomp/issues) com a sua GPU, a versão do
+- **Relatar um bug**: [abra uma issue](https://github.com/mitch030504/PokeZ-ARecomp-Online/issues) com a sua GPU, a versão do
   driver, a versão do jogo e o `logs/play.log`.
 
 ## Compilando o código-fonte

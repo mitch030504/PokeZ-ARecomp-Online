@@ -7,9 +7,6 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-DLLS = ('amd_fidelityfx_loader_vk.dll', 'amd_fidelityfx_upscaler_vk.dll', 'avcodec-63.dll',
-        'avformat-63.dll', 'avutil-61.dll', 'libgcc_s_seh-1.dll', 'libiconv-2.dll',
-        'libshaderc_shared.dll', 'libstdc++-6.dll', 'libwinpthread-1.dll', 'SDL3.dll', 'swscale-10.dll')
 
 
 def copy_file(src, dest):
@@ -39,12 +36,18 @@ def main():
     for n in ('lasrecomp.exe', 'Lumiose Online.exe', 'lasrecomp.dll.a'):
         copy_file(build / n, out / n)
     copy_file(build / 'lasrecomp.dll.a', out / 'build/lasrecomp.dll.a')
-    for n in DLLS: copy_file(a.support / n, out / n)
-    for n in ('LICENSE', 'README.md', 'Baloo2-SemiBold.ttf', 'Baloo2-OFL.txt', 'AMD-FSR-LICENSE.md'):
+    for dll in sorted(a.support.glob('*.dll')):
+        if dll.name.lower() == 'vulkan-1.dll': continue
+        copy_file(dll, out / dll.name)
+    for req in ('SDL3.dll', 'libshaderc_shared.dll', 'amd_fidelityfx_loader_vk.dll', 'amd_fidelityfx_upscaler_vk.dll'):
+        if not (out / req).is_file(): raise RuntimeError(f'Required runtime DLL missing: {req}')
+    for n in ('LICENSE', 'README.md', 'README.pt-BR.md', 'za-default.ini', 'Baloo2-SemiBold.ttf', 'Baloo2-OFL.txt', 'AMD-FSR-LICENSE.md'):
         if (a.support / n).is_file(): copy_file(a.support / n, out / n)
     copy_file(ROOT / 'README.md', out / 'ZA-Recomp-README.md')
     copy_file(ROOT / 'LICENSE', out / 'ZA-Recomp-LICENSE.txt')
     copy_file(ROOT / 'docs/PC-CONTROLS.md', out / 'docs/PC-CONTROLS.md')
+    if (a.support / 'docs/XBOX-ATTACK-LAYOUT.md').is_file():
+        copy_file(a.support / 'docs/XBOX-ATTACK-LAYOUT.md', out / 'docs/XBOX-ATTACK-LAYOUT.md')
     for n in ('DejaVuSans.ttf', 'DejaVuSans-Bold.ttf'):
         copy_file(ROOT / 'third_party/fonts/DejaVu' / n, out / n)
     copy_file(ROOT / 'third_party/fonts/DejaVu/LICENSE', out / 'DejaVu-LICENSE.txt')
@@ -57,13 +60,14 @@ def main():
     for n in ('dx12/dzn_icd.x86_64.json', 'dx12/vulkan_dzn.dll', 'dx12/Mesa-LICENSE.rst',
               'dx12/D3D12-Agility-LICENSE.txt', 'D3D12/D3D12Core.dll'):
         if not (out / n).is_file(): raise RuntimeError(f'Required DirectX support file missing: {n}')
-    for n in ('cpu.h', 'simd.h', 'simd_fp.h', 'gamelib.h'):
+    for n in ('cpu.h', 'simd.h', 'simd_fp.h', 'gamelib.h', 'modlib.h'):
         copy_file(ROOT / 'runtime' / n, out / 'gamelib-src' / n)
     copy_file(ROOT / 'tools/gamelib_entry.c', out / 'gamelib-src/gamelib_entry.c')
+    copy_file(ROOT / 'tools/modlib_entry.c', out / 'gamelib-src/modlib_entry.c')
     copy_file(ROOT / 'runtime/hle/hle_symbols.txt', out / 'gamelib-src/hle_symbols.txt')
     shutil.copytree(ROOT / 'runtime', out / 'runtime', ignore=shutil.ignore_patterns('__pycache__'))
     for src in (ROOT / 'tools').glob('*.py'): copy_file(src, out / 'tools' / src.name)
-    for n in ('gamelib_entry.c', 'lumiose_test_entry.c'):
+    for n in ('gamelib_entry.c', 'modlib_entry.c', 'lumiose_test_entry.c'):
         copy_file(ROOT / 'tools' / n, out / 'tools' / n)
     copy_file(ROOT / 'tools/rando/patch_variants.json', out / 'tools/rando/patch_variants.json')
     shutil.copytree(ROOT / 'tools/lumiose', out / 'tools/lumiose', ignore=shutil.ignore_patterns('__pycache__', '*.subsdk9', 'prepackaged.subsdk9'))
@@ -86,6 +90,7 @@ def main():
         'site-packages', '__pycache__', 'test', 'tests', 'idlelib', 'tkinter', 'turtledemo', 'ensurepip', 'venv'))
     shutil.copytree(a.deps, out / 'python-deps', ignore=shutil.ignore_patterns('__pycache__'))
     copy_file(ROOT / 'LUMIOSE-RELEASE.md', out / 'READ ME - Lumiose Online.md')
+    copy_file(ROOT / 'CHANGELOG.md', out / 'CHANGELOG.md')
     forbidden = {'.nsp', '.xci', '.nca', '.nso'}
     for f in out.rglob('*'):
         if not f.is_file(): continue

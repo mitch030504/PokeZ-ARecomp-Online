@@ -15,7 +15,13 @@
 #     don't exist (the command list was refused).
 set -e
 cd "$(dirname "$0")/../.."
-export PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"
+if [ -d /ucrt64/bin ]; then
+    UCRT_BIN=/ucrt64/bin
+    export PATH="/ucrt64/bin:/usr/bin:$PATH"
+else
+    UCRT_BIN=/c/msys64/ucrt64/bin
+    export PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"
+fi
 MESA=26.2.5 SHA=794b3d1729075dae7ebd47c7283b7ca0cdb5dec668f7f11cc0a5d82f6138a0a5 AGILITY=1.620.1
 W=build/dx12-work O=build/dx12
 CURL=/c/Windows/System32/curl.exe  # (MSYS2's curl fails on some certificate setups)
@@ -39,9 +45,9 @@ printf '{\n    "ICD": {\n        "api_version": "1.1.354",\n        "library_arc
 need=$(objdump -p $O/dx12/vulkan_dzn.dll | awk '/DLL Name/ {print $3}')
 while [ -n "$need" ]; do
     set -- $need; d=$1; shift; need="$*"
-    [ -f /c/msys64/ucrt64/bin/$d ] && [ ! -f $O/dx12/$d ] || continue
-    cp /c/msys64/ucrt64/bin/$d $O/dx12/
-    need="$need $(objdump -p /c/msys64/ucrt64/bin/$d | awk '/DLL Name/ {print $3}')"
+    [ -f "$UCRT_BIN/$d" ] && [ ! -f "$O/dx12/$d" ] || continue
+    cp "$UCRT_BIN/$d" "$O/dx12/"
+    need="$need $(objdump -p "$UCRT_BIN/$d" | awk '/DLL Name/ {print $3}')"
 done
 # dxil.dll (Microsoft's DXIL validator and signer, which Dozen loads): from the same Mesa release's Windows build
 [ -f $W/mesa3d-$MESA-release-msvc.7z ] || $CURL -fsSL -o $W/mesa3d-$MESA-release-msvc.7z \

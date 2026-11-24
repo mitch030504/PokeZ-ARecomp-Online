@@ -9,12 +9,20 @@
 **English** · [Português (Brasil)](README.pt-BR.md)
 
 [Download](https://github.com/mitch030504/PokeZ-ARecomp-Online/releases/latest) ·
+[Changelog](CHANGELOG.md) ·
+[Report a bug](https://github.com/mitch030504/PokeZ-ARecomp-Online/issues) ·
+[Lumiose Guide](LUMIOSE.md) ·
+[PC Controls](docs/PC-CONTROLS.md)
 
 </div>
 
 ---
 
-ZA Recomp turns the game's Nintendo Switch code into a native Windows program. The ARM64 code is translated ahead of
+This repository is a maintained fork of **[Hexveil404/PokeZ-ARecomp](https://github.com/Hexveil404/PokeZ-ARecomp)**
+combining upstream ZA Recomp releases with **Lumiose Online** integration, native PC keyboard/mouse controls, and
+Switch 2 Edition (`.nup`) / Linux RADV & FSR 4 improvements.
+
+ZA Recomp turns the game's Nintendo Switch code into a native PC program. The ARM64 code is translated ahead of
 time into C and compiled for x86-64 on your PC, and the Switch's operating system and GPU (NVN) are reimplemented on
 top of Vulkan. No emulator runs while you play.
 
@@ -59,10 +67,17 @@ It is built on **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by Peiikai
 - Internal resolution from 25% up to 4x (1x = 1080p), plus Dynamic and Match display
 - Frame pacing option (Smooth / Standard) for displays where the frame rate looks uneven
 
+**Online & Content**
+- **Lumiose Online**: bundled Lumiose integration with native chat, Discord Rich Presence, and local icon/model UI compatibility (see [LUMIOSE.md](LUMIOSE.md))
+- **P2P Link Play (`F1 > Online`)**: serverless link trades and private battles over LAN or internet
+- **Mystery Gift (`F1 > Online > Mystery Gift`)** and **Online-only content (`F1 > Content`)**: Ranked Mega Stones in the Mega Shard exchange and trade evolutions without trading
+- **Code mods**: run `exefs/subsdk0-9` (exlaunch / Hakkun) and `.pchtxt` patches toggled per mod on the Mods page
+
 **Graphics** (all optional, off by default)
-- Upscaling with AMD FSR 1, anti-aliasing with SMAA or AMD FSR 2 (temporal), sharpening
+- Upscaling with AMD FSR 1, anti-aliasing with SMAA, AMD FSR 2 / FSR 3.1, or NVIDIA DLAA (with per-object motion vectors)
 - Optional AMD FSR 4.1.2 temporal upscaling on Linux with a user-supplied FidelityFX provider (RDNA4; see
   [docs/linux.md](docs/linux.md#fsr-412-temporal-upscaling-optional-linux))
+- 21:9+ unlocked widescreen view, Full-detail models, Draw distance scaling (1.5× / 2× / 3×), and Camera distance slider
 - HDR output (HDR10 / scRGB)
 - Ambient occlusion (GTAO), indirect light (screen-space GI) and water reflections
 - Sharper shadows (higher shadow map resolution) and high-quality texture filtering
@@ -71,16 +86,16 @@ It is built on **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by Peiikai
   [DirectX 12](#directx-12))
 
 **Controls**
-- Any SDL3 controller: Xbox, PlayStation (DualShock 4 / DualSense), Switch Pro, Steam Deck and more
-- Keyboard and mouse, with a mouse-driven camera
+- Any SDL3 controller: Xbox, PlayStation (DualShock 4 / DualSense), Switch Pro, Steam Deck and more, with multi-gamepad auto-switching and stick dead-zone sliders
+- Native PC keyboard and mouse controls (see [docs/PC-CONTROLS.md](docs/PC-CONTROLS.md))
 - Every button and key can be rebound; button icons match your controller (Xbox, PlayStation, Nintendo, Steam Deck,
-  keyboard). Xbox / PlayStation / Steam pads use their own A/B/X/Y labels; Nintendo pads keep the Switch positions
+  keyboard). First-start Xbox-letters preset for Xbox / PlayStation / Steam Deck pads plus F1 Nintendo/Xbox presets
 - In the name entry, A types, B deletes, Start / Menu confirms (or select OK); on-screen keyboard for any connected pad
 - Battle moves by position, right stick snap to axis
 
 **Start screen**
-- Sets the game up from your own files and compiles it once on your PC
-- Mods manager (romfs mods), save import / export and backups
+- Sets the game up from your own files (extracted `exefs`/`romfs`, `.xci`/`.nsp`, or Switch 2 Edition `.nup`), verifies pack integrity, and compiles once on your PC
+- Mods manager (`romfs` mods and opt-in `exefs`/`.pchtxt` code mods), save import / export and backups
 - English and Portuguese (Brazil)
 
 ## Requirements
@@ -168,8 +183,8 @@ Ubuntu / Linux Mint / Debian; other distributions have the same packages under t
 2. Get the source and build the AppImage (downloads and builds its libraries the first time, which takes a while):
 
    ```bash
-   git clone https://github.com/Hexveil404/PokeZ-ARecomp.git
-   cd PokeZ-ARecomp
+   git clone https://github.com/mitch030504/PokeZ-ARecomp-Online.git
+   cd PokeZ-ARecomp-Online
    tools/za/dist-linux.sh
    ```
 
@@ -245,7 +260,9 @@ Mods that replace game files (a `romfs` folder): translations, textures, models.
 (or drop the mod onto the window); they are kept in `mods/`. When two mods replace the same file, the one higher in the
 list wins.
 
-Mods that change the game's code (`exefs`, IPS patches, cheat plugins) do not work with a recompiled game.
+Code mods (`exefs/subsdk0-9` exlaunch / Hakkun modules and `.pchtxt` byte patches) are supported and can be enabled per
+mod on the **Mods** page (off by default; enabling a code mod compiles its library once). Legacy IPS patches and cheat
+plugins that do not use `.pchtxt` / `subsdk` are not supported.
 
 ### Brazilian Portuguese translation
 
@@ -393,7 +410,7 @@ card's **DirectX 12** driver, which helps where the Vulkan driver crashes or mis
   **F1 > Online > Mystery Gift** is on and look at the `[mystery-gift]` lines in `logs/play.log` (the gifts listed, or
   why a download failed; curl's own messages are in `cache/mystery_gift/curl.log`). Offline, the gifts downloaded
   before are used.
-- **Report a bug**: [open an issue](https://github.com/Hexveil404/PokeZ-ARecomp/issues) with your GPU, driver version,
+- **Report a bug**: [open an issue](https://github.com/mitch030504/PokeZ-ARecomp-Online/issues) with your GPU, driver version,
   game version and `logs/play.log`.
 
 ## Building from source

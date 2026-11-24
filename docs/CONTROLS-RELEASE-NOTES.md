@@ -1,3 +1,5 @@
+> For **v0.1.34+** release notes, see [CHANGELOG.md](../CHANGELOG.md) and [LUMIOSE-RELEASE.md](../LUMIOSE-RELEASE.md).
+
 # v0.1.33 — Controller mouse UI hotfix
 
 - Keeps the mouse cursor visible and clickable while a controller is connected, including after controller buttons, sticks, or keyboard input.

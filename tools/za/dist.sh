@@ -7,7 +7,11 @@
 # FFmpeg: the LGPL build from tools/build_deps_windows.sh (build/deps-win, made here once; MSYS2's is GPL).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-export PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"
+if [ -d /ucrt64/bin ]; then
+    export PATH="/ucrt64/bin:/usr/bin:$PATH"
+else
+    export PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"
+fi
 GENOPT="-O1 -DGUEST_VOLATILE" GENARCH=-march=x86-64-v3  # (the game code's flags: part of the library id)
 B=build/za-dist D="build/dist-za/ZA Recomp"
 
@@ -18,9 +22,10 @@ if [ ! -x build/zig/zig.exe ]; then
     [ -f $ZIP_ZIG ] || /c/Windows/System32/curl.exe -fsSL -o $ZIP_ZIG https://ziglang.org/download/0.17.0/zig-x86_64-windows-0.17.0.zip
     bash tools/fetch_zig.sh
 fi
+PY312=${PY312:-py -3.12}
 # 2. the generator helper (its own venv: only what gen.py needs, not the randomizer's packages)
 if [ ! -f build/gen-venv/.ok ]; then
-    py -3.12 -m venv build/gen-venv
+    $PY312 -m venv build/gen-venv
     build/gen-venv/Scripts/python.exe -m pip install -q capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5 pyinstaller==6.22.3
     touch build/gen-venv/.ok
 fi
@@ -38,7 +43,7 @@ mkdir -p build/ooz
     -o ../../build/ooz/lzna.o && g++ -O2 -include sys/stat.h -c oodec.cpp -o ../../build/ooz/oodec.o &&
     cd ../../build/ooz && g++ -static kraken.o bitknit.o lzna.o oodec.o -o oodec.exe -Wl,-u,__mingw_fe_dfl_env)
 if [ ! -f build/prompts-venv/.ok2 ]; then  # (.ok2: texture2ddecoder, the team icons' BC7)
-    py -3.12 -m venv build/prompts-venv
+    $PY312 -m venv build/prompts-venv
     build/prompts-venv/Scripts/python.exe -m pip install -q pillow==13.0.0 numpy==2.5.4 fonttools==4.67.0 cffsubr==0.4.0 texture2ddecoder==1.0.6 \
         pyinstaller==6.22.3
     touch build/prompts-venv/.ok2
